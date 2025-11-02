@@ -3,22 +3,56 @@ import anthropic
 from transformers import pipeline
 import openai, re, random, time, json, replicate, os
 
+import transformers
+transformers.logging.set_verbosity_error()
+
 llama2_url = "meta/llama-2-70b-chat"
 llama3_url = "meta/meta-llama-3-70b-instruct"
 mixtral_url = "mistralai/mixtral-8x7b-instruct-v0.1"
+
+# Simple cache for HF pipelines so we only load once per model id
+HUGGINGFACE_PIPES = {}
 
 def load_huggingface_model(model_name):
     pipe = pipeline("text-generation", model=model_name, device_map="auto")
     return pipe
 
-def inference_huggingface(prompt, pipe):
-    response = pipe(prompt, max_new_tokens=100)[0]["generated_text"]
-    response = response.replace(prompt, "")
+# def inference_huggingface(prompt, pipe):
+#     response = pipe(prompt, max_new_tokens=100)[0]["generated_text"]
+#     response = response.replace(prompt, "")
+#     return response
+
+def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.05):
+    """
+    Run inference on a Hugging Face pipeline.
+    
+    Args:
+        prompt: The formatted input text
+        pipe: The Hugging Face pipeline
+        max_new_tokens: Maximum number of new tokens to generate
+        temperature: Sampling temperature (lower = more deterministic)
+    
+    Returns:
+        The generated text (with prompt removed)
+    """
+    # Generate with parameters matching your other models
+    response = pipe(
+        prompt, 
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        do_sample=temperature > 0,  # Use sampling if temperature > 0
+        return_full_text=False  # This removes the prompt automatically
+    )[0]["generated_text"]
+    
+    # Clean up any leading/trailing whitespace
+    response = response.strip()
+    
     return response
 
-
+# def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, image_requested=False, scene=None, max_prompt_len=2**14, clip_prompt=False):
+#     if model_str not in ["gpt4", "gpt3.5", "gpt4o", 'llama-2-70b-chat', "mixtral-8x7b", "gpt-4o-mini", "llama-3-70b-instruct", "gpt4v", "claude3.5sonnet", "o1-preview"] and "_HF" not in model_str:
 def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, image_requested=False, scene=None, max_prompt_len=2**14, clip_prompt=False):
-    if model_str not in ["gpt4", "gpt3.5", "gpt4o", 'llama-2-70b-chat', "mixtral-8x7b", "gpt-4o-mini", "llama-3-70b-instruct", "gpt4v", "claude3.5sonnet", "o1-preview"] and "_HF" not in model_str:
+    if model_str not in ["gpt4", "gpt3.5", "gpt4o", 'llama-2-70b-chat', "mixtral-8x7b", "gpt-4o-mini", "llama-3-70b-instruct", "gpt4v", "claude3.5sonnet", "o1-preview"] and not model_str.startswith("HF_"):
         raise Exception("No model by the name {}".format(model_str))
     for _ in range(tries):
         if clip_prompt: prompt = prompt[:max_prompt_len]
@@ -64,7 +98,7 @@ def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, image_
                             max_tokens=200,
                         )
                 answer = response["choices"][0]["message"]["content"]
-            if model_str == "gpt4":
+            elif model_str == "gpt4":
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}]
@@ -165,11 +199,71 @@ def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, image_
                         "max_new_tokens": 200})
                 answer = ''.join(output)
                 answer = re.sub("\s+", " ", answer)
-            elif "HF_" in model_str:
-                input_text = system_prompt + prompt 
-                #if self.pipe is None:
-                #    self.pipe = load_huggingface_model(self.backend.replace("HF_", ""))
-                raise Exception("Sorry, fixing TODO :3") #inference_huggingface(input_text, self.pipe)
+            # elif "HF_" in model_str:
+            #     input_text = system_prompt + prompt 
+            #     #if self.pipe is None:
+            #     #    self.pipe = load_huggingface_model(self.backend.replace("HF_", ""))
+            #     raise Exception("Sorry, fixing TODO :3") #inference_huggingface(input_text, self.pipe)
+            # elif model_str.startswith("HF_"):
+            #     # Normalize to the raw HF repo id, e.g., "HF_mistralai/Mixtral-8x7B-Instruct-v0.1" -> "mistralai/Mixtral-8x7B-Instruct-v0.1"
+            #     hf_id = model_str[3:]
+            #     pipe = HUGGINGFACE_PIPES.get(hf_id)
+            #     if pipe is None:
+            #         pipe = load_huggingface_model(hf_id)
+            #         HUGGINGFACE_PIPES[hf_id] = pipe
+            #     input_text = system_prompt + prompt
+            #     answer = inference_huggingface(input_text, pipe)
+            #     answer = re.sub("\s+", " ", answer)
+            # elif model_str.startswith("HF_"):
+            #     hf_id = model_str[3:]  # e.g., "mistralai/Mixtral-8x7B-Instruct-v0.1"
+            #     pipe = HUGGINGFACE_PIPES.get(hf_id)
+            #     if pipe is None:
+            #         pipe = load_huggingface_model(hf_id)  # should return a text-generation/chat pipeline
+            #         HUGGINGFACE_PIPES[hf_id] = pipe
+            
+            #     # Build chat—prefer the model's chat template if available
+            #     messages = [
+            #         {"role": "system", "content": system_prompt},
+            #         {"role": "user", "content": prompt},
+            #     ]
+            #     # Let inference_huggingface apply tokenizer.apply_chat_template(...) if available
+            #     answer = inference_huggingface(
+            #         messages=messages,
+            #         pipe=pipe,
+            #         temperature=0.05,
+            #         max_new_tokens=200,
+            #     )
+            #     answer = re.sub(r"\s+", " ", answer)
+            elif model_str.startswith("HF_"):
+                # Extract the HF repo id
+                hf_id = model_str[3:]
+                
+                # Load or retrieve cached pipeline
+                pipe = HUGGINGFACE_PIPES.get(hf_id)
+                if pipe is None:
+                    pipe = load_huggingface_model(hf_id)
+                    HUGGINGFACE_PIPES[hf_id] = pipe
+                
+                # Format the prompt appropriately for instruction-tuned models
+                # Many HF models use chat templates
+                if hasattr(pipe.tokenizer, 'apply_chat_template') and pipe.tokenizer.chat_template:
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                    input_text = pipe.tokenizer.apply_chat_template(
+                        messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                    # print('chat template applied!')
+                else:
+                    # Fallback for models without chat templates
+                    input_text = f"{system_prompt}\n\n{prompt}"
+                
+                answer = inference_huggingface(input_text, pipe)
+                answer = re.sub(r"\s+", " ", answer)
+            
             return answer
         
         except Exception as e:
@@ -634,18 +728,19 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                 doctor_dialogue = input("\nQuestion for patient: ")
             else: 
                 doctor_dialogue = doctor_agent.inference_doctor(pi_dialogue, image_requested=imgs)
-            print("Doctor [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), doctor_dialogue)
+            print("Doctor [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), doctor_dialogue + "\n")
             # Doctor has arrived at a diagnosis, check correctness
             if "DIAGNOSIS READY" in doctor_dialogue:
                 correctness = compare_results(doctor_dialogue, scenario.diagnosis_information(), moderator_llm, pipe) == "yes"
                 if correctness: total_correct += 1
                 print("\nCorrect answer:", scenario.diagnosis_information())
-                print("Scene {}, The diagnosis was ".format(_scenario_id), "CORRECT" if correctness else "INCORRECT", int((total_correct/total_presents)*100))
+                print(f"Scene {_scenario_id}: The diagnosis was {'CORRECT' if correctness else 'INCORRECT'}. Accuracy: {int((total_correct/total_presents)*100)}%")
+                print("#"*300)
                 break
             # Obtain medical exam from measurement reader
             if "REQUEST TEST" in doctor_dialogue:
                 pi_dialogue = meas_agent.inference_measurement(doctor_dialogue,)
-                print("Measurement [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue)
+                print("Measurement [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue + "\n")
                 patient_agent.add_hist(pi_dialogue)
             # Obtain response from patient
             else:
@@ -653,7 +748,7 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                     pi_dialogue = input("\nResponse to doctor: ")
                 else:
                     pi_dialogue = patient_agent.inference_patient(doctor_dialogue)
-                print("Patient [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue)
+                print("Patient [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), pi_dialogue + "\n")
                 meas_agent.add_hist(pi_dialogue)
             # Prevent API timeouts
             time.sleep(1.0)
