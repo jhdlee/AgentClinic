@@ -258,6 +258,7 @@ def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, image_
                         tokenize=False, 
                         add_generation_prompt=True
                     )
+                    print(f'input_text: {input_text}')
                     # print('chat template applied!')
                 else:
                     # Fallback for models without chat templates
@@ -727,7 +728,10 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
             else: imgs = False
             # Check if final inference
             if _inf_id + 1 == total_inferences:
-                pi_dialogue += "This is the final interaction. You must provide a diagnosis with \"DIAGNOSIS READY: [diagnosis here]\" without asking further questions or requesting tests.\n"
+                # pi_dialogue += "This is the final interaction. You must provide a diagnosis with \"DIAGNOSIS READY: [diagnosis here]\" without asking further questions or requesting tests.\n"
+                pi_dialogue += "This is the final interaction. First, provide your complete reasoning process leading to the diagnosis. "
+                pi_dialogue += "Explain your reasoning clearly and concisely. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\". "
+                pi_dialogue += "Do not ask further questions or request additional tests."
 
             print(f'pi_dialogue: {pi_dialogue}')
             # Obtain doctor dialogue (human or llm agent)
