@@ -3,6 +3,8 @@ import anthropic
 from transformers import pipeline
 import openai, re, random, time, json, replicate, os
 
+import numpy as np
+
 import transformers
 transformers.logging.set_verbosity_error()
 
@@ -22,7 +24,7 @@ def load_huggingface_model(model_name):
 #     response = response.replace(prompt, "")
 #     return response
 
-def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.05):
+def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.0):
     """
     Run inference on a Hugging Face pipeline.
     
@@ -692,6 +694,8 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
     else:
         pipe = None
     if num_scenarios is None: num_scenarios = scenario_loader.num_scenarios
+
+    inf_nums = []
     for _scenario_id in range(0, min(num_scenarios, scenario_loader.num_scenarios)):
         total_presents += 1
         pi_dialogue = str()
@@ -712,6 +716,7 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
             max_infs=total_inferences, 
             img_request=img_request)
 
+        print(f'total inferences: {total_inferences}')
         doctor_dialogue = ""
         for _inf_id in range(total_inferences):
             # Check for medical image request
@@ -721,8 +726,10 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                 else: imgs = True
             else: imgs = False
             # Check if final inference
-            if _inf_id == total_inferences - 1:
-                pi_dialogue += "This is the final question. Please provide a diagnosis.\n"
+            if _inf_id + 1 == total_inferences:
+                pi_dialogue += "This is the final interaction. You must provide a diagnosis with \"DIAGNOSIS READY: [diagnosis here]\" without asking further questions or requesting tests.\n"
+
+            print(f'pi_dialogue: {pi_dialogue}')
             # Obtain doctor dialogue (human or llm agent)
             if inf_type == "human_doctor":
                 doctor_dialogue = input("\nQuestion for patient: ")
@@ -730,11 +737,14 @@ def main(api_key, replicate_api_key, inf_type, doctor_bias, patient_bias, doctor
                 doctor_dialogue = doctor_agent.inference_doctor(pi_dialogue, image_requested=imgs)
             print("Doctor [{}%]:".format(int(((_inf_id+1)/total_inferences)*100)), doctor_dialogue + "\n")
             # Doctor has arrived at a diagnosis, check correctness
-            if "DIAGNOSIS READY" in doctor_dialogue:
+            if _inf_id + 1 == total_inferences or "DIAGNOSIS READY" in doctor_dialogue:
                 correctness = compare_results(doctor_dialogue, scenario.diagnosis_information(), moderator_llm, pipe) == "yes"
                 if correctness: total_correct += 1
                 print("\nCorrect answer:", scenario.diagnosis_information())
                 print(f"Scene {_scenario_id}: The diagnosis was {'CORRECT' if correctness else 'INCORRECT'}. Accuracy: {int((total_correct/total_presents)*100)}%")
+
+                inf_nums.append(_inf_id+1)
+                print(f"Number of interactions: {_inf_id+1}, Avg: {np.mean(np.array(inf_nums))}")
                 print("#"*300)
                 break
             # Obtain medical exam from measurement reader
