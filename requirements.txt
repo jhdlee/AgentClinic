@@ -5,8 +5,3 @@ argparse
 transformers
 datasets
 anthropic
-trl<0.10.1
-peft
-accelerate
-bitsandbytes
-wandb
