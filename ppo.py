@@ -844,6 +844,7 @@ def load_model_and_tokenizer(
     load_source = args.resume_ckpt_dir or args.model_name or args.base_model_name
     device_map = "auto" if args.device == "auto" else {"": args.device}
 
+    load_source = load_source.replace("HF_", "")
     logger.info("Loading policy model from %s", load_source)
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         load_source,
