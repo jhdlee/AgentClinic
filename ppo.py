@@ -1032,7 +1032,7 @@ def train(args) -> None:
         model=model,
         ref_model=ref_model,
         processing_class=tokenizer,
-        dataset=None,
+        train_dataset=None,
         data_collator=None,
     )
 
