@@ -55,12 +55,21 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+
+def _stringify_context(value) -> str:
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {_stringify_context(v)}" for k, v in value.items())
+    if isinstance(value, list):
+        return "; ".join(_stringify_context(v) for v in value)
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # HuggingFace utility functions
 # ---------------------------------------------------------------------------
 
-def load_huggingface_model(model_name):
-    pipe = pipeline("text-generation", model=model_name, device_map="auto")
+def load_huggingface_model(model):
+    pipe = pipeline("text-generation", model=model, device_map="auto")
     return pipe
 
 def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.0):
@@ -93,22 +102,25 @@ def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.0):
 # Simple cache for HF pipelines so we only load once per model id
 HUGGINGFACE_PIPES = {}
 
-def query_model(model_str, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False):
+def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False):
     for _ in range(tries):
         if clip_prompt: 
             prompt = prompt[:max_prompt_len]
         try:
-            if not model_str.startswith("HF_"):
-                raise ValueError("Only HuggingFace backends prefixed with 'HF_' are currently supported.")
-            # Extract the HF repo id
-            hf_id = model_str[3:]
-            
-            # Load or retrieve cached pipeline
-            pipe = HUGGINGFACE_PIPES.get(hf_id)
-            if pipe is None:
-                pipe = load_huggingface_model(hf_id)
-                HUGGINGFACE_PIPES[hf_id] = pipe
-            
+            if isinstance(model, str):
+                if not model.startswith("HF_"):
+                    raise ValueError("Only HuggingFace backends prefixed with 'HF_' are currently supported.")
+                # Extract the HF repo id
+                hf_id = model[3:]
+                
+                # Load or retrieve cached pipeline
+                pipe = HUGGINGFACE_PIPES.get(hf_id)
+                if pipe is None:
+                    pipe = load_huggingface_model(hf_id)
+                    HUGGINGFACE_PIPES[hf_id] = pipe
+            else:
+                pipe = load_huggingface_model(model)
+                
             # Format the prompt appropriately for instruction-tuned models
             # Many HF models use chat templates
             if hasattr(pipe.tokenizer, 'apply_chat_template') and pipe.tokenizer.chat_template:
@@ -331,8 +343,6 @@ def generate_doctor_bias_prompt(bias_type: Optional[str]) -> str:
 @dataclass
 class EpisodeTurn:
     prompt: str
-    query_tensor: torch.LongTensor
-    response_tensor: torch.LongTensor
     doctor_text: str
     action: DoctorAction
     reply_role: Optional[str]
@@ -392,6 +402,8 @@ def normalize_text(text: str) -> str:
 def parse_action(text: str) -> DoctorAction:
     clean_text = text.strip()
     diag_match = re.search(r"DIAGNOSIS\s*READY\s*:\s*(.+)", clean_text, flags=re.IGNORECASE)
+    test_match = re.search(r"REQUEST\s+TEST\s*:\s*(.+)", clean_text, flags=re.IGNORECASE)
+
     if diag_match:
         diagnosis = diag_match.group(1).strip()
         return DoctorAction(
@@ -400,9 +412,7 @@ def parse_action(text: str) -> DoctorAction:
             payload=diagnosis,
             normalized_payload=normalize_text(diagnosis),
         )
-
-    test_match = re.search(r"REQUEST\s+TEST\s*:\s*(.+)", clean_text, flags=re.IGNORECASE)
-    if test_match:
+    elif test_match:
         test_name = test_match.group(1).strip()
         return DoctorAction(
             type="test_request",
@@ -410,13 +420,13 @@ def parse_action(text: str) -> DoctorAction:
             payload=test_name,
             normalized_payload=normalize_text(test_name),
         )
-
-    return DoctorAction(
-        type="question",
-        text=clean_text,
-        payload=clean_text,
-        normalized_payload=normalize_text(clean_text),
-    )
+    else:
+        return DoctorAction(
+            type="question",
+            text=clean_text,
+            payload=clean_text,
+            normalized_payload=normalize_text(clean_text),
+        )
 
 
 class AgentClinicSimulator:
@@ -500,43 +510,52 @@ class AgentClinicSimulator:
     def build_prompt(
         self,
         state: DoctorEpisodeState,
+        previous_reply_role: Optional[str],
+        previous_reply_text: Optional[str],
         forbidden_questions: Optional[Sequence[str]] = None,
     ) -> str:
         turns_taken = len(state.actions)
         turns_remaining = max(state.max_turns - turns_taken, 0)
 
-        instructions = [
-            "You are Dr. Agent, a clinician interacting with a standardized patient.",
-            "On each turn you may:",
-            "- Ask a concise question to gather information.",
-            "- Request diagnostic tests via 'REQUEST TEST: <test name>'.",
-            "- Finish with 'DIAGNOSIS READY: <diagnosis>'.",
-            f"You have {turns_remaining} turn(s) remaining out of {state.max_turns}.",
+        system_prompt = [
+            "You are a doctor named Dr. Agent who only responds in the form of dialogue. You are inspecting a patient who you will ask questions in order to understand their disease.",
+            f"You are only allowed to ask {state.max_turns} questions total before you must make a decision. You have asked {turns_taken} questions so far.",
+            "You can request test results using the format \"REQUEST TEST: [test]\". For example, \"REQUEST TEST: Chest_X-Ray\".",
+            "Your dialogue will only be 1-3 sentences in length.",
+            "Once you have decided to make a diagnosis please type \"DIAGNOSIS READY: [diagnosis here]\".",
         ]
-        if turns_remaining == 0:
-            instructions.append(
-                "You have exhausted your turns; do not ask further questions or request additional tests; first, provide your complete reasoning process leading to the diagnosis; explain your reasoning clearly and concisely; then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\". "
-            )
-        if forbidden_questions:
-            formatted = ", ".join(f'"{q}"' for q in forbidden_questions)
-            instructions.append(
-                f"Do not ask the following question(s) again during this interaction: {formatted}."
-            )
         bias_prompt = generate_doctor_bias_prompt(self.doctor_bias)
         if bias_prompt:
-            instructions.append(bias_prompt)
-        instruction_block = "\n".join(instructions)
+            system_prompt.append(bias_prompt)
+        if forbidden_questions:
+            formatted = ", ".join(f'"{q}"' for q in forbidden_questions)
+            system_prompt.append(
+                f"Do not ask the following question(s) during this interaction: {formatted}."
+            )
+        system_prompt.append("\n\nBelow is all of the information you have. {}. \n\n Remember, you must discover their disease by asking them questions. You are also able to provide exams.".format(state.scenario.examiner_information()))
+        system_prompt_str = " ".join(system_prompt)
 
-        conversation = ""
+        prompt = ["\nHere is a history of your dialogue: "]
         if state.history:
-            conversation_lines = [
+            history_str = [
                 f"{turn['role'].capitalize()}: {turn['content']}" for turn in state.history
             ]
-            conversation = "\n".join(conversation_lines)
+            prompt.append("; ".join(history_str[:-1]) + ".")
+        else:
+            prompt.append("No dialogue yet.")
+        if previous_reply_role and previous_reply_text:
+            prompt.append(f"\nHere was the {previous_reply_role.capitalize()} response: {previous_reply_text}.")
+        else:
+            prompt.append("The patient awaits your first question.")
 
-        if conversation:
-            return f"{instruction_block}\n\nConversation so far:\n{conversation}\n\nDoctor:"
-        return f"{instruction_block}\n\nDoctor:"
+        if turns_remaining == 1:
+            prompt.append("This is the final interaction. First, provide your complete reasoning process leading to the diagnosis.")
+            prompt.append("Explain your reasoning clearly and concisely. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\". Do not ask further questions or request additional tests.")
+        prompt.append("Now please continue your dialogue\nDoctor: ")
+
+        prompt_str = " ".join(prompt)
+
+        return prompt_str, system_prompt_str
 
     def run_episode(
         self,
@@ -545,24 +564,24 @@ class AgentClinicSimulator:
     ) -> Tuple[DoctorEpisodeState, Dict[str, float]]:
         state = self.reset_by_id(scenario_id)
 
+        previous_reply_role = None
+        previous_reply_text = None
         while not state.done:
-            prompt = self.build_prompt(state)
+            prompt, system_prompt = self.build_prompt(state, previous_reply_role, previous_reply_text)
             history_before = copy.deepcopy(state.history)
             patient_hist_before = state.patient_agent.agent_hist
             measurement_hist_before = state.measurement_agent.agent_hist
             remaining_budget_before = state.remaining_budget
 
-            query_tensor, response_tensor, doctor_text = generate_fn(
-                prompt, state.scenario_id, len(state.turns)
-            )
-            action = parse_action(doctor_text)
+            doctor_response = generate_fn(system_prompt, system_prompt)
+            action = parse_action(doctor_response)
             reply_role, reply_text = self._apply_action(state, action)
+            previous_reply_role = reply_role
+            previous_reply_text = reply_text
             state.turns.append(
                 EpisodeTurn(
                     prompt=prompt,
-                    query_tensor=query_tensor,
-                    response_tensor=response_tensor,
-                    doctor_text=doctor_text,
+                    doctor_text=doctor_response,
                     action=action,
                     reply_role=reply_role,
                     reply_text=reply_text,
@@ -580,8 +599,9 @@ class AgentClinicSimulator:
                     flush=True,
                 )
                 print("[Prompt]\n" + prompt, flush=True)
+                print("[System Prompt]\n" + system_prompt, flush=True)
                 print(
-                    f"[Doctor -> Patient/Test]\n{doctor_text}",
+                    f"[Doctor -> Patient/Test]\n{doctor_response}",
                     flush=True,
                 )
                 if reply_role and reply_text:
@@ -610,8 +630,7 @@ class AgentClinicSimulator:
             state.diagnosis_action = action
             state.done = True
             return None, ""
-
-        if action.type == "test_request":
+        elif action.type == "test_request":
             reply_role = "measurement"
             reply_text = state.measurement_agent.inference_measurement(action.text)
             state.patient_agent.add_hist(reply_text)
@@ -754,15 +773,19 @@ class AgentClinicSimulator:
         forbidden_questions = list(forbidden_questions or [])
         forbidden_norm = {normalize_text(q) for q in forbidden_questions}
 
+        previous_reply_role = None
+        previous_reply_text = None
         while not state.done:
-            prompt = self.build_prompt(state, forbidden_questions=forbidden_questions)
+            prompt, system_prompt = self.build_prompt(state, previous_reply_role, previous_reply_text, forbidden_questions)
             attempts = 0
             while True:
-                query_tensor, response_tensor, doctor_text = generate_fn(
-                    prompt, state.scenario_id, len(state.turns)
+                doctor_response = generate_fn(
+                    prompt, system_prompt
                 )
-                normalized = normalize_text(doctor_text)
-                if forbidden_norm and normalized in forbidden_norm:
+                normalized = normalize_text(doctor_response)
+
+                # TODO: need a better way to check for the equivalency of the questions
+                if forbidden_norm and normalized in forbidden_norm: 
                     attempts += 1
                     if attempts >= self.forbidden_retry_limit:
                         if self.debug_print:
@@ -772,18 +795,21 @@ class AgentClinicSimulator:
                         return
                     prompt += (
                         "\n\nReminder: Do not repeat the question \""
-                        + doctor_text
+                        + doctor_response
                         + "\". Ask something different or provide a diagnosis."
                     )
                     if self.debug_print:
                         print(
-                            f"[Episode {state.scenario_id}] Counterfactual rollout rejected forbidden question repeat \"{doctor_text}\" (attempt {attempts})."
+                            f"[Episode {state.scenario_id}] Counterfactual rollout rejected forbidden question repeat \"{doctor_response}\" (attempt {attempts})."
                         )
                     continue
                 break
 
-            action = parse_action(doctor_text)
-            self._apply_action(state, action)
+            action = parse_action(doctor_response)
+            reply_role, reply_text = self._apply_action(state, action)
+
+            previous_reply_role = reply_role
+            previous_reply_text = reply_text
 
     def _evaluate_correctness(
         self, state: DoctorEpisodeState
@@ -792,25 +818,13 @@ class AgentClinicSimulator:
         moderator_decision = ""
         if state.diagnosis_action:
             gold_text = state.scenario.diagnosis_information()
-            gold = normalize_text(gold_text)
-            predicted = (
-                state.diagnosis_action.normalized_payload
-                or normalize_text(state.diagnosis_action.payload or state.diagnosis_action.text)
-            )
             if self.moderator_backend:
-                try:
-                    moderator_decision = compare_results(
-                        diagnosis=state.diagnosis_action.text,
-                        correct_diagnosis=gold_text,
-                        moderator_llm=self.moderator_backend,
-                    )
-                    correctness = 1.0 if moderator_decision.strip().startswith("yes") else 0.0
-                except Exception as exc:  # pragma: no cover - best effort moderation
-                    logger.warning(
-                        "Moderator check failed (%s); falling back to string matching.", exc
-                    )
-            if correctness == 0.0 and gold:
-                correctness = 1.0 if predicted == gold else 0.0
+                moderator_decision = compare_results(
+                    diagnosis=state.diagnosis_action.text,
+                    correct_diagnosis=gold_text,
+                    moderator_llm=self.moderator_backend,
+                )
+                correctness = 1.0 if moderator_decision.strip().startswith("yes") else 0.0
         return correctness, moderator_decision
 
 
@@ -1049,7 +1063,6 @@ def train(args) -> None:
         data_collator=None,
     )
 
-    generation_kwargs = prepare_generation_kwargs(args, tokenizer)
     checkpoint_manager = CheckpointManager(output_dir, args.save_total_limit)
 
     if args.wandb_project:
@@ -1068,71 +1081,15 @@ def train(args) -> None:
 
     def generate_response(
         prompt: str,
-        scenario_id: Optional[int] = None,
-        turn_idx: Optional[int] = None,
-    ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        query_tensors = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask")
-        if args.debug_print:
-            print("\n----- GENERATION REQUEST -----", flush=True)
-            print(
-                f"Scenario: {scenario_id} | Turn: {turn_idx} | Prompt tokens: {query_tensors.shape[-1]}",
-                flush=True,
+        system_prompt: str,
+    ) -> str:
+        with torch.no_grad():
+            response = query_model(
+                policy_model,
+                prompt,
+                system_prompt,
             )
-            print(
-                f"Sampling kwargs: {generation_kwargs}",
-                flush=True,
-            )
-            print("[Prompt]\n" + prompt, flush=True)
-        try:
-            with torch.no_grad():
-                output_tensors = policy_model.generate(
-                    query_tensors,
-                    attention_mask=attention_mask,
-                    **generation_kwargs,
-                )
-        except RuntimeError as exc:
-            if "probability tensor contains" in str(exc):
-                print(
-                    f"[Generation] invalid probabilities encountered "
-                    f"(scenario={scenario_id} turn={turn_idx}). Falling back to greedy decoding.",
-                    flush=True,
-                )
-                print(
-                    f"[Generation] prompt snippet: {prompt[-500:]}",
-                    flush=True,
-                )
-                fallback_kwargs = dict(generation_kwargs)
-                fallback_kwargs.update(
-                    {
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                        "do_sample": False,
-                    }
-                )
-                try:
-                    with torch.no_grad():
-                        output_tensors = policy_model.generate(
-                            query_tensors,
-                            attention_mask=attention_mask,
-                            **fallback_kwargs,
-                        )
-                except Exception as inner_exc:
-                    print(
-                        "[Generation] Greedy fallback also failed. Raising original exception.",
-                        flush=True,
-                    )
-                    raise inner_exc from exc
-            else:
-                raise
-        generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
-        if generated_tokens.shape[-1] == 0:
-            generated_tokens = output_tensors[:, -1:]
-        query_tensor = query_tensors.squeeze(0).detach()
-        response_tensor = generated_tokens.squeeze(0).detach()
-        response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
-        return query_tensor, response_tensor, response_text
+        return response
 
     global_step = 0
     episodes_completed = 0
