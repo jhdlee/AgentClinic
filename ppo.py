@@ -552,7 +552,9 @@ class AgentClinicSimulator:
             measurement_hist_before = state.measurement_agent.agent_hist
             remaining_budget_before = state.remaining_budget
 
-            query_tensor, response_tensor, doctor_text = generate_fn(prompt)
+            query_tensor, response_tensor, doctor_text = generate_fn(
+                prompt, state.scenario_id, len(state.turns)
+            )
             action = parse_action(doctor_text)
             reply_role, reply_text = self._apply_action(state, action)
             state.turns.append(
@@ -1058,8 +1060,8 @@ def train(args) -> None:
 
     def generate_response(
         prompt: str,
-        scenario_id: int,
-        turn_idx: int,
+        scenario_id: Optional[int] = None,
+        turn_idx: Optional[int] = None,
     ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         query_tensors = inputs["input_ids"]
