@@ -1089,29 +1089,34 @@ def train(args) -> None:
                 continue
 
             reward_value = episode_info.pop("reward")
-            per_turn_rewards = [
-                torch.tensor(0.0, device=device, dtype=torch.float32)
-                for _ in range(len(turns))
-            ]
-            per_turn_rewards[-1] = torch.tensor(
+            query_tensor = torch.cat(
+                [turn.query_tensor for turn in turns], dim=0
+            )
+            response_tensor = torch.cat(
+                [turn.response_tensor for turn in turns], dim=0
+            )
+            reward_tensor = torch.tensor(
                 reward_value, device=device, dtype=torch.float32
             )
 
             stats = trainer.step(
-                [turn.query_tensor for turn in turns],
-                [turn.response_tensor for turn in turns],
-                per_turn_rewards,
+                [query_tensor],
+                [response_tensor],
+                [reward_tensor],
             )
 
-            batch = {
-                "prompt": [turn.prompt for turn in turns],
-                "response": [turn.doctor_text for turn in turns],
-                "reward": [reward.item() for reward in per_turn_rewards],
-                "scenario_id": [state.scenario_id] * len(turns),
-                "turn_index": list(range(len(turns))),
-                "action_type": [turn.action.type for turn in turns],
-            }
-            trainer.log_stats(stats, batch, per_turn_rewards)
+            trainer.log_stats(
+                stats,
+                {
+                    "prompt": [turns[-1].prompt],
+                    "response": [turns[-1].doctor_text],
+                    "reward": [reward_value],
+                    "scenario_id": [state.scenario_id],
+                    "turn_index": [len(turns) - 1],
+                    "action_type": [turns[-1].action.type],
+                },
+                [reward_tensor],
+            )
 
             if trainer.accelerator.is_main_process:
                 scalar_logs = {
