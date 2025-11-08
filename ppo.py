@@ -1028,10 +1028,10 @@ def train(args) -> None:
     )
 
     trainer = PPOTrainer(
-        config=ppo_config,
+        args=ppo_config,
         model=model,
         ref_model=ref_model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         dataset=None,
         data_collator=None,
     )
