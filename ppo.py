@@ -437,6 +437,7 @@ class AgentClinicSimulator:
         seed: int = 0,
         patient_bias: Optional[str] = None,
         doctor_bias: Optional[str] = None,
+        debug_print: bool = False,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -456,6 +457,7 @@ class AgentClinicSimulator:
         self.random = random.Random(seed)
         self._utility_warning_emitted = False
         self.forbidden_retry_limit = 3
+        self.debug_print = debug_print
 
     # ------------------------------------------------------------------
     # Episode lifecycle
@@ -569,6 +571,16 @@ class AgentClinicSimulator:
                 )
             )
 
+            if self.debug_print:
+                turn_num = len(state.turns)
+                print(
+                    f"[Episode {state.scenario_id}] Turn {turn_num} Doctor: {doctor_text}"
+                )
+                if reply_role and reply_text:
+                    print(
+                        f"[Episode {state.scenario_id}] {reply_role.capitalize()}: {reply_text}"
+                    )
+
         reward, components = self._compute_episode_reward(state, generate_fn)
         components.setdefault("num_turns", len(state.actions))
         components.setdefault(
@@ -648,6 +660,14 @@ class AgentClinicSimulator:
             + self.budget_reward_weight * budget_fraction
             + self.question_reward_weight * question_reward_total
         )
+        if self.debug_print:
+            print(
+                f"[Episode {state.scenario_id}] Reward components | "
+                f"diagnosis={correctness:.3f} (w={self.diagnosis_reward_weight}) | "
+                f"budget={budget_fraction:.3f} (w={self.budget_reward_weight}) | "
+                f"question={question_reward_total:.3f} (w={self.question_reward_weight}) | "
+                f"total={reward:.3f}"
+            )
         return reward, {
             "correctness": correctness,
             "budget_saved": budget_fraction,
@@ -666,7 +686,16 @@ class AgentClinicSimulator:
         counterfactual_correctness = self._simulate_counterfactual_correctness(
             state, question_idx, generate_fn, action
         )
-        return correctness_actual - counterfactual_correctness
+        utility = correctness_actual - counterfactual_correctness
+        if self.debug_print:
+            print(
+                f"[Episode {state.scenario_id}] Counterfactual utility | "
+                f"Q{question_idx + 1}: \"{action.text}\" | "
+                f"actual={correctness_actual:.3f} | "
+                f"counterfactual={counterfactual_correctness:.3f} | "
+                f"utility={utility:.3f}"
+            )
+        return utility
 
     def _simulate_counterfactual_correctness(
         self,
@@ -724,12 +753,20 @@ class AgentClinicSimulator:
                 if forbidden_norm and normalized in forbidden_norm:
                     attempts += 1
                     if attempts >= self.forbidden_retry_limit:
+                        if self.debug_print:
+                            print(
+                                f"[Episode {state.scenario_id}] Aborting counterfactual rollout after {attempts} repeated forbidden question attempts."
+                            )
                         return
                     prompt += (
                         "\n\nReminder: Do not repeat the question \""
                         + doctor_text
                         + "\". Ask something different or provide a diagnosis."
                     )
+                    if self.debug_print:
+                        print(
+                            f"[Episode {state.scenario_id}] Counterfactual rollout rejected forbidden question repeat \"{doctor_text}\" (attempt {attempts})."
+                        )
                     continue
                 break
 
@@ -969,6 +1006,7 @@ def train(args) -> None:
         seed=args.seed,
         patient_bias=args.patient_bias,
         doctor_bias=args.doctor_bias,
+        debug_print=args.debug_print,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1277,6 +1315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget_reward_weight", type=float, default=1.0, help="Weight applied to budget fraction in episode reward")
     parser.add_argument("--question_reward_weight", type=float, default=1.0, help="Weight applied to the summed question utilities")
     parser.add_argument("--diagnosis_reward_weight", type=float, default=1.0, help="Weight applied to diagnosis correctness")
+    parser.add_argument("--debug_print", action="store_true", help="Print interactions and counterfactual details for debugging")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
