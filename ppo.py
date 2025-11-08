@@ -1226,7 +1226,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("AgentClinic PPO fine-tuning")
     parser.add_argument("--dataset_path", type=str, default="agentclinic_medqa.jsonl", help="Path to AgentClinic JSONL dataset")
     parser.add_argument("--max_scenarios", type=int, default=None, help="Optional cap on scenarios for quicker iterations")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to store checkpoints and final policy")
+    parser.add_argument("--output_dir", type=str, default="outputs/ppo_run", help="Directory to store checkpoints and final policy")
     parser.add_argument("--base_model_name", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="Base HF model id for initialisation")
     parser.add_argument("--model_name", type=str, default=None, help="Optional SFT checkpoint to initialise from")
     parser.add_argument("--tokenizer_name", type=str, default=None, help="Tokenizer identifier (defaults to base model)")
