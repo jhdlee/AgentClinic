@@ -1023,16 +1023,17 @@ def train(args) -> None:
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        num_ppo_epochs=args.num_ppo_epochs,
+        ppo_epochs=args.num_ppo_epochs,
         remove_unused_columns=False,
+        is_peft_model=args.use_lora,
     )
 
     trainer = PPOTrainer(
-        args=ppo_config,
+        config=ppo_config,
         model=model,
         ref_model=ref_model,
-        processing_class=tokenizer,
-        train_dataset=None,
+        tokenizer=tokenizer,
+        dataset=None,
         data_collator=None,
     )
 
