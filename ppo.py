@@ -748,7 +748,9 @@ class AgentClinicSimulator:
             prompt = self.build_prompt(state, forbidden_questions=forbidden_questions)
             attempts = 0
             while True:
-                query_tensor, response_tensor, doctor_text = generate_fn(prompt)
+                query_tensor, response_tensor, doctor_text = generate_fn(
+                    prompt, state.scenario_id, len(state.turns)
+                )
                 normalized = normalize_text(doctor_text)
                 if forbidden_norm and normalized in forbidden_norm:
                     attempts += 1
@@ -1054,16 +1056,61 @@ def train(args) -> None:
     device = trainer.accelerator.device
     policy_model = trainer.accelerator.unwrap_model(trainer.model).pretrained_model
 
-    def generate_response(prompt: str) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
+    def generate_response(
+        prompt: str,
+        scenario_id: int,
+        turn_idx: int,
+    ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         query_tensors = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
-        with torch.no_grad():
-            output_tensors = policy_model.generate(
-                query_tensors,
-                attention_mask=attention_mask,
-                **generation_kwargs,
+        if args.debug_print:
+            print(
+                f"[Generation] scenario={scenario_id} turn={turn_idx} "
+                f"prompt_len={query_tensors.shape[-1]} kwargs={generation_kwargs}",
+                flush=True,
             )
+        try:
+            with torch.no_grad():
+                output_tensors = policy_model.generate(
+                    query_tensors,
+                    attention_mask=attention_mask,
+                    **generation_kwargs,
+                )
+        except RuntimeError as exc:
+            if "probability tensor contains" in str(exc):
+                print(
+                    f"[Generation] invalid probabilities encountered "
+                    f"(scenario={scenario_id} turn={turn_idx}). Falling back to greedy decoding.",
+                    flush=True,
+                )
+                print(
+                    f"[Generation] prompt snippet: {prompt[-500:]}",
+                    flush=True,
+                )
+                fallback_kwargs = dict(generation_kwargs)
+                fallback_kwargs.update(
+                    {
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "do_sample": False,
+                    }
+                )
+                try:
+                    with torch.no_grad():
+                        output_tensors = policy_model.generate(
+                            query_tensors,
+                            attention_mask=attention_mask,
+                            **fallback_kwargs,
+                        )
+                except Exception as inner_exc:
+                    print(
+                        "[Generation] Greedy fallback also failed. Raising original exception.",
+                        flush=True,
+                    )
+                    raise inner_exc from exc
+            else:
+                raise
         generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
         if generated_tokens.shape[-1] == 0:
             generated_tokens = output_tensors[:, -1:]
