@@ -911,6 +911,7 @@ def load_reference_model(
 
     ref_source = args.ref_model_name or args.base_model_name
     device_map = "auto" if args.device == "auto" else {"": args.device}
+    ref_source = ref_source.replace("HF_", "")
     logger.info("Loading reference model from %s", ref_source)
     ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
         ref_source,
