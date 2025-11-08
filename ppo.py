@@ -874,6 +874,7 @@ def load_model_and_tokenizer(
         )
 
     tokenizer_name = args.tokenizer_name or args.base_model_name
+    tokenizer_name = tokenizer_name.replace("HF_", "")
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_name,
         use_fast=not args.disable_fast_tokenizer,
