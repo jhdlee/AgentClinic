@@ -1097,9 +1097,9 @@ def train(args) -> None:
             )
 
             stats = trainer.step(
-                queries=[turn.query_tensor for turn in turns],
-                responses=[turn.response_tensor for turn in turns],
-                rewards=per_turn_rewards,
+                [turn.query_tensor for turn in turns],
+                [turn.response_tensor for turn in turns],
+                per_turn_rewards,
             )
 
             batch = {
