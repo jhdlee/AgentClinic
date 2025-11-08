@@ -576,12 +576,20 @@ class AgentClinicSimulator:
             if self.debug_print:
                 turn_num = len(state.turns)
                 print(
-                    f"[Episode {state.scenario_id}] Turn {turn_num} Doctor: {doctor_text}"
+                    f"\n========== EPISODE {state.scenario_id} :: TURN {turn_num} ==========",
+                    flush=True,
+                )
+                print("[Prompt]\n" + prompt, flush=True)
+                print(
+                    f"[Doctor -> Patient/Test]\n{doctor_text}",
+                    flush=True,
                 )
                 if reply_role and reply_text:
                     print(
-                        f"[Episode {state.scenario_id}] {reply_role.capitalize()}: {reply_text}"
+                        f"[{reply_role.capitalize()} -> Doctor]\n{reply_text}",
+                        flush=True,
                     )
+                print("=" * 60, flush=True)
 
         reward, components = self._compute_episode_reward(state, generate_fn)
         components.setdefault("num_turns", len(state.actions))
@@ -1067,11 +1075,16 @@ def train(args) -> None:
         query_tensors = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
         if args.debug_print:
+            print("\n----- GENERATION REQUEST -----", flush=True)
             print(
-                f"[Generation] scenario={scenario_id} turn={turn_idx} "
-                f"prompt_len={query_tensors.shape[-1]} kwargs={generation_kwargs}",
+                f"Scenario: {scenario_id} | Turn: {turn_idx} | Prompt tokens: {query_tensors.shape[-1]}",
                 flush=True,
             )
+            print(
+                f"Sampling kwargs: {generation_kwargs}",
+                flush=True,
+            )
+            print("[Prompt]\n" + prompt, flush=True)
         try:
             with torch.no_grad():
                 output_tensors = policy_model.generate(
@@ -1128,7 +1141,7 @@ def train(args) -> None:
 
     for epoch in range(args.num_train_epochs):
         scenario_indices = list(range(scenario_loader.num_scenarios))
-        random.shuffle(scenario_indices)
+        # random.shuffle(scenario_indices)
         logger.info("Starting epoch %s with %s scenarios", epoch + 1, len(scenario_indices))
 
         for scenario_idx in scenario_indices:
