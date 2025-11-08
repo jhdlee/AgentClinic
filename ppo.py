@@ -1023,7 +1023,7 @@ def train(args) -> None:
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        ppo_epochs=args.num_ppo_epochs,
+        num_ppo_epochs=args.num_ppo_epochs,
         remove_unused_columns=False,
     )
 
