@@ -1210,12 +1210,19 @@ def train(args) -> None:
         #         print("[System Prompt]\n" + system_prompt_text, flush=True)
         #     print("[Prompt]\n" + user_prompt_text, flush=True)
 
+        was_training = policy_model.training
+        if was_training:
+            policy_model.eval()
+
         with torch.no_grad():
             output_tensors = policy_model.generate(
                 query_tensors,
                 attention_mask=attention_mask,
                 **generation_kwargs,
             )
+
+        if was_training:
+            policy_model.train()
 
         generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
         if generated_tokens.shape[-1] == 0:
@@ -1248,31 +1255,29 @@ def train(args) -> None:
             if not turn_rewards or len(turn_rewards) != len(turns):
                 turn_rewards = [reward_value for _ in turns]
 
-            query_tensors = [turn.query_tensor for turn in turns]
-            response_tensors = [turn.response_tensor for turn in turns]
-            reward_tensors = [
-                torch.tensor(turn_reward, device=device, dtype=torch.float32)
-                for turn_reward in turn_rewards
-            ]
-
-            stats = trainer.step(
-                query_tensors,
-                response_tensors,
-                reward_tensors,
+            for turn_idx, (turn, turn_reward) in enumerate(zip(turns, turn_rewards)):
+                reward_tensor = torch.tensor(
+                    [turn_reward], device=device, dtype=torch.float32
                 )
 
-            trainer.log_stats(
-                stats,
-                {
-                    "prompt": [turn.prompt for turn in turns],
-                    "response": [turn.doctor_text for turn in turns],
-                    "reward": turn_rewards,
-                    "scenario_id": [state.scenario_id] * len(turns),
-                    "turn_index": list(range(len(turns))),
-                    "action_type": [turn.action.type for turn in turns],
-                },
-                reward_tensors,
-            )
+                stats = trainer.step(
+                    [turn.query_tensor],
+                    [turn.response_tensor],
+                    [reward_tensor],
+                )
+
+                trainer.log_stats(
+                    stats,
+                    {
+                        "prompt": [turn.prompt],
+                        "response": [turn.doctor_text],
+                        "reward": [turn_reward],
+                        "scenario_id": [state.scenario_id],
+                        "turn_index": [turn_idx],
+                        "action_type": [turn.action.type],
+                    },
+                    [reward_tensor],
+                )
 
             if trainer.accelerator.is_main_process:
                 scalar_logs = {
@@ -1463,8 +1468,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_fast_tokenizer", action="store_true", help="Force use of slow tokenizer implementation")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing on the policy model")
 
-    parser.add_argument("--batch_size", type=int, default=16, help="PPO batch size")
-    parser.add_argument("--mini_batch_size", type=int, default=2, help="PPO mini-batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="PPO batch size (currently forced to 1 by environment loop)")
+    parser.add_argument("--mini_batch_size", type=int, default=1, help="PPO mini-batch size (forced to 1)")
     parser.add_argument("--num_ppo_epochs", type=int, default=4, help="Number of PPO optimisation epochs per batch")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of passes over the scenario list")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
