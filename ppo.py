@@ -344,6 +344,8 @@ def generate_doctor_bias_prompt(bias_type: Optional[str]) -> str:
 class EpisodeTurn:
     prompt: str
     doctor_text: str
+    query_tensor: torch.LongTensor
+    response_tensor: torch.LongTensor
     action: DoctorAction
     reply_role: Optional[str]
     reply_text: str
@@ -469,6 +471,10 @@ class AgentClinicSimulator:
         self.forbidden_retry_limit = 3
         self.debug_print = debug_print
 
+    @staticmethod
+    def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
+        return system_prompt, prompt
+
     # ------------------------------------------------------------------
     # Episode lifecycle
     # ------------------------------------------------------------------
@@ -573,7 +579,12 @@ class AgentClinicSimulator:
             measurement_hist_before = state.measurement_agent.agent_hist
             remaining_budget_before = state.remaining_budget
 
-            doctor_response = generate_fn(system_prompt, system_prompt)
+            model_input = self._format_model_input(system_prompt, prompt)
+            query_tensor, response_tensor, doctor_response = generate_fn(
+                model_input,
+                scenario_id=state.scenario_id,
+                turn_idx=len(state.turns),
+            )
             action = parse_action(doctor_response)
             reply_role, reply_text = self._apply_action(state, action)
             previous_reply_role = reply_role
@@ -582,6 +593,8 @@ class AgentClinicSimulator:
                 EpisodeTurn(
                     prompt=prompt,
                     doctor_text=doctor_response,
+                    query_tensor=query_tensor,
+                    response_tensor=response_tensor,
                     action=action,
                     reply_role=reply_role,
                     reply_text=reply_text,
@@ -776,11 +789,19 @@ class AgentClinicSimulator:
         previous_reply_role = None
         previous_reply_text = None
         while not state.done:
-            prompt, system_prompt = self.build_prompt(state, previous_reply_role, previous_reply_text, forbidden_questions)
+            prompt, system_prompt = self.build_prompt(
+                state,
+                previous_reply_role,
+                previous_reply_text,
+                forbidden_questions,
+            )
+            model_input = self._format_model_input(system_prompt, prompt)
             attempts = 0
             while True:
-                doctor_response = generate_fn(
-                    prompt, system_prompt
+                _, _, doctor_response = generate_fn(
+                    model_input,
+                    scenario_id=state.scenario_id,
+                    turn_idx=len(state.turns),
                 )
                 normalized = normalize_text(doctor_response)
 
@@ -793,11 +814,12 @@ class AgentClinicSimulator:
                                 f"[Episode {state.scenario_id}] Aborting counterfactual rollout after {attempts} repeated forbidden question attempts."
                             )
                         return
-                    prompt += (
+                    prompt = prompt + (
                         "\n\nReminder: Do not repeat the question \""
                         + doctor_response
                         + "\". Ask something different or provide a diagnosis."
                     )
+                    model_input = self._format_model_input(system_prompt, prompt)
                     if self.debug_print:
                         print(
                             f"[Episode {state.scenario_id}] Counterfactual rollout rejected forbidden question repeat \"{doctor_response}\" (attempt {attempts})."
@@ -1063,6 +1085,7 @@ def train(args) -> None:
         data_collator=None,
     )
 
+    generation_kwargs = prepare_generation_kwargs(args, tokenizer)
     checkpoint_manager = CheckpointManager(output_dir, args.save_total_limit)
 
     if args.wandb_project:
@@ -1081,15 +1104,68 @@ def train(args) -> None:
 
     def generate_response(
         prompt: str,
-        system_prompt: str,
-    ) -> str:
-        with torch.no_grad():
-            response = query_model(
-                policy_model,
-                prompt,
-                system_prompt,
+        scenario_id: Optional[int] = None,
+        turn_idx: Optional[int] = None,
+    ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
+        if isinstance(prompt, tuple):
+            system_prompt_text, user_prompt_text = prompt
+            system_prompt_text = system_prompt_text or ""
+        else:
+            system_prompt_text = ""
+            user_prompt_text = prompt
+
+        chat_messages: List[Dict[str, str]] = []
+        if system_prompt_text:
+            chat_messages.append({"role": "system", "content": system_prompt_text})
+        chat_messages.append({"role": "user", "content": user_prompt_text})
+
+        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+            prompt_for_model = tokenizer.apply_chat_template(
+                chat_messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
-        return response
+        else:
+            prompt_for_model = (
+                f"{system_prompt_text}\n\n{user_prompt_text}"
+                if system_prompt_text
+                else user_prompt_text
+            )
+
+        inputs = tokenizer(prompt_for_model, return_tensors="pt").to(device)
+        query_tensors = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask")
+
+        # if args.debug_print:
+        #     print("\n----- GENERATION REQUEST -----", flush=True)
+        #     print(
+        #         f"Scenario: {scenario_id} | Turn: {turn_idx} | Prompt tokens: {query_tensors.shape[-1]}",
+        #         flush=True,
+        #     )
+        #     print(
+        #         f"Sampling kwargs: {generation_kwargs}",
+        #         flush=True,
+        #     )
+        #     if system_prompt_text:
+        #         print("[System Prompt]\n" + system_prompt_text, flush=True)
+        #     print("[Prompt]\n" + user_prompt_text, flush=True)
+
+        with torch.no_grad():
+            output_tensors = policy_model.generate(
+                query_tensors,
+                attention_mask=attention_mask,
+                **generation_kwargs,
+            )
+
+        generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
+        if generated_tokens.shape[-1] == 0:
+            generated_tokens = output_tensors[:, -1:]
+
+        query_tensor = query_tensors.squeeze(0).detach()
+        response_tensor = generated_tokens.squeeze(0).detach()
+        response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
+
+        return query_tensor, response_tensor, response_text
 
     global_step = 0
     episodes_completed = 0
@@ -1333,11 +1409,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
 
-    parser.add_argument("--max_turns", type=int, default=8, help="Maximum doctor turns before forced diagnosis")
+    parser.add_argument("--max_turns", type=int, default=5, help="Maximum doctor turns before forced diagnosis")
     parser.add_argument("--question_cost", type=float, default=1.0, help="Budget cost per non-diagnosis action")
     parser.add_argument("--temporal_decay_beta", type=float, default=1.0, help="Temporal decay exponent β for question rewards ( (N-i)/N )^β")
     parser.add_argument("--budget_reward_weight", type=float, default=1.0, help="Weight applied to budget fraction in episode reward")
