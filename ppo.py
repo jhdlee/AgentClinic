@@ -562,7 +562,7 @@ class AgentClinicSimulator:
             prompt.append("The patient awaits your first question.")
 
         if turns_remaining == 1:
-            prompt.append("This is the final interaction. Provide your final diagnosis. Do not ask further questions or request additional tests.")
+            prompt.append("This is the final interaction. Provide your complete reasoning process leading to the diagnosis. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\". Do not ask further questions or request additional tests.")
         prompt.append("Now please continue your dialogue.\nDoctor: ")
 
         prompt_str = " ".join(prompt)
