@@ -1248,33 +1248,29 @@ def train(args) -> None:
             if not turn_rewards or len(turn_rewards) != len(turns):
                 turn_rewards = [reward_value for _ in turns]
 
-            query_tensors = [turn.query_tensor for turn in turns]
-            response_tensors = [turn.response_tensor for turn in turns]
-            reward_tensors = [
-                torch.tensor(
+            for turn_idx, (turn, turn_reward) in enumerate(zip(turns, turn_rewards)):
+                reward_tensor = torch.tensor(
                     [turn_reward], device=device, dtype=torch.float32
                 )
-                for turn_reward in turn_rewards
-            ]
 
-            stats = trainer.step(
-                query_tensors,
-                response_tensors,
-                reward_tensors,
-            )
+                stats = trainer.step(
+                    [turn.query_tensor],
+                    [turn.response_tensor],
+                    [reward_tensor],
+                )
 
-            trainer.log_stats(
-                stats,
-                {
-                    "prompt": [turn.prompt for turn in turns],
-                    "response": [turn.doctor_text for turn in turns],
-                    "reward": turn_rewards,
-                    "scenario_id": [state.scenario_id] * len(turns),
-                    "turn_index": list(range(len(turns))),
-                    "action_type": [turn.action.type for turn in turns],
-                },
-                reward_tensors,
-            )
+                trainer.log_stats(
+                    stats,
+                    {
+                        "prompt": [turn.prompt],
+                        "response": [turn.doctor_text],
+                        "reward": [turn_reward],
+                        "scenario_id": [state.scenario_id],
+                        "turn_index": [turn_idx],
+                        "action_type": [turn.action.type],
+                    },
+                    [reward_tensor],
+                )
 
             if trainer.accelerator.is_main_process:
                 scalar_logs = {
