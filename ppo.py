@@ -183,7 +183,14 @@ class ScenarioMedQA:
 
 
 class ScenarioLoaderMedQA:
-    def __init__(self, path: str = "agentclinic_medqa.jsonl", max_scenarios: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        path: str = "agentclinic_medqa.jsonl",
+        max_scenarios: Optional[int] = None,
+        test_size: Optional[int] = None,
+        test_ratio: Optional[float] = None,
+        seed: int = 42,
+    ) -> None:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Dataset not found at {path}")
         with open(path, "r", encoding="utf-8") as f:
@@ -195,6 +202,30 @@ class ScenarioLoaderMedQA:
         self.scenarios = [ScenarioMedQA(data, idx) for idx, data in enumerate(scenario_strs)]
         self.num_scenarios = len(self.scenarios)
 
+        # Split into train/test if requested
+        self.train_indices = list(range(self.num_scenarios))
+        self.test_indices = []
+
+        if test_size is not None or test_ratio is not None:
+            rng = random.Random(seed)
+            all_indices = list(range(self.num_scenarios))
+            rng.shuffle(all_indices)
+
+            if test_size is not None:
+                num_test = min(test_size, self.num_scenarios)
+            else:
+                num_test = int(self.num_scenarios * test_ratio)
+
+            self.test_indices = sorted(all_indices[:num_test])
+            self.train_indices = sorted(all_indices[num_test:])
+
+            logger.info(
+                "Split scenarios: %d train, %d test (total: %d)",
+                len(self.train_indices),
+                len(self.test_indices),
+                self.num_scenarios,
+            )
+
     def sample_scenario(self):
         return random.choice(self.scenarios)
 
@@ -202,6 +233,12 @@ class ScenarioLoaderMedQA:
         if id is None:
             return self.sample_scenario()
         return self.scenarios[id]
+
+    def get_train_indices(self):
+        return self.train_indices
+
+    def get_test_indices(self):
+        return self.test_indices
 
 # ---------------------------------------------------------------------------
 # Agents
@@ -1223,9 +1260,18 @@ def train(args) -> None:
     scenario_loader = ScenarioLoaderMedQA(
         path=args.dataset_path,
         max_scenarios=args.max_scenarios,
+        test_size=args.test_size,
+        test_ratio=args.test_ratio,
+        seed=args.seed,
     )
     if scenario_loader.num_scenarios == 0:
         raise ValueError("No scenarios loaded; verify --dataset_path and format.")
+
+    train_indices = scenario_loader.get_train_indices()
+    test_indices = scenario_loader.get_test_indices()
+
+    if not train_indices:
+        raise ValueError("No training scenarios available after train/test split.")
 
     simulator = AgentClinicSimulator(
         scenario_loader=scenario_loader,
@@ -1366,9 +1412,9 @@ def train(args) -> None:
     episode_metrics: List[Dict[str, float]] = []
 
     for epoch in range(args.num_train_epochs):
-        scenario_indices = list(range(scenario_loader.num_scenarios))
+        scenario_indices = train_indices.copy()
         # random.shuffle(scenario_indices)
-        logger.info("Starting epoch %s with %s scenarios", epoch + 1, len(scenario_indices))
+        logger.info("Starting epoch %s with %s training scenarios", epoch + 1, len(scenario_indices))
 
         for scenario_idx in scenario_indices:
             state, episode_info = simulator.run_episode(scenario_idx, generate_response)
@@ -1387,39 +1433,37 @@ def train(args) -> None:
                 turn_rewards = [reward_value for _ in turns]
                 turn_breakdown = None
 
-            for turn_idx, (turn, turn_reward) in enumerate(zip(turns, turn_rewards)):
-                reward_tensor = torch.tensor(
-                    [turn_reward], device=device, dtype=torch.float32
-                )
+            # Collect all turns from the episode
+            query_tensors = [turn.query_tensor for turn in turns]
+            response_tensors = [turn.response_tensor for turn in turns]
+            reward_tensors = [
+                torch.tensor([r], device=device, dtype=torch.float32)
+                for r in turn_rewards
+            ]
 
-                stats = trainer.step(
-                    [turn.query_tensor],
-                    [turn.response_tensor],
-                    [reward_tensor],
-                )
+            # Single trainer.step() call with all turns from the episode
+            stats = trainer.step(query_tensors, response_tensors, reward_tensors)
 
-                trainer.log_stats(
+            # Prepare batch data for logging
+            batch_data = {
+                "prompt": [turn.prompt for turn in turns],
+                "response": [turn.doctor_text for turn in turns],
+                "reward": turn_rewards,
+                "scenario_id": [state.scenario_id] * len(turns),
+                "turn_index": list(range(len(turns))),
+                "action_type": [turn.action.type for turn in turns],
+            }
+
+            # Log stats once for the entire episode
+            trainer.log_stats(stats, batch_data, reward_tensors)
+
+            # Gradient verification once per episode
+            if args.debug_verify_gradients and trainer.accelerator.is_main_process:
+                verify_ppo_gradients(
+                    trainer,
                     stats,
-                    {
-                        "prompt": [turn.prompt],
-                        "response": [turn.doctor_text],
-                        "reward": [turn_reward],
-                        "scenario_id": [state.scenario_id],
-                        "turn_index": [turn_idx],
-                        "action_type": [turn.action.type],
-                    },
-                    [reward_tensor],
+                    context=f"epoch={epoch + 1},scenario={state.scenario_id},num_turns={len(turns)}",
                 )
-
-                if (
-                    args.debug_verify_gradients
-                    and trainer.accelerator.is_main_process
-                ):
-                    verify_ppo_gradients(
-                        trainer,
-                        stats,
-                        context=f"epoch={epoch + 1},scenario={state.scenario_id},turn={turn_idx + 1}",
-                    )
 
             if trainer.accelerator.is_main_process:
                 scalar_logs = {
@@ -1482,35 +1526,72 @@ def train(args) -> None:
             avg_turns,
         )
 
-    # Evaluate final policy for reporting
-    eval_accuracy = None
-    eval_avg_turns = None
+    # Evaluate final policy on train and test sets
     if trainer.accelerator.is_main_process:
         was_training = policy_model.training
         policy_model.eval()
-        eval_metrics: List[Dict[str, float]] = []
-        for scenario_idx in range(scenario_loader.num_scenarios):
+
+        # Evaluate on training set
+        train_eval_metrics: List[Dict[str, float]] = []
+        logger.info("Evaluating on %d training scenarios...", len(train_indices))
+        for scenario_idx in train_indices:
             state, episode_info = simulator.run_episode(scenario_idx, generate_response)
-            eval_metrics.append(
+            train_eval_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
                     "num_turns": len(state.turns),
                 }
             )
+
+        if train_eval_metrics:
+            total_correct = sum(m["correctness"] for m in train_eval_metrics)
+            train_accuracy = total_correct / len(train_eval_metrics)
+            train_avg_turns = sum(m["num_turns"] for m in train_eval_metrics) / len(train_eval_metrics)
+            logger.info(
+                "[TRAIN EVAL] accuracy=%.3f (%s/%s), avg_interactions=%.2f",
+                train_accuracy,
+                int(total_correct),
+                len(train_eval_metrics),
+                train_avg_turns,
+            )
+            if args.wandb_project and wandb:
+                wandb.log({
+                    "final_eval/train_accuracy": train_accuracy,
+                    "final_eval/train_avg_interactions": train_avg_turns,
+                })
+
+        # Evaluate on test set if available
+        if test_indices:
+            test_eval_metrics: List[Dict[str, float]] = []
+            logger.info("Evaluating on %d test scenarios...", len(test_indices))
+            for scenario_idx in test_indices:
+                state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+                test_eval_metrics.append(
+                    {
+                        "correctness": episode_info.get("correctness", 0.0),
+                        "num_turns": len(state.turns),
+                    }
+                )
+
+            if test_eval_metrics:
+                total_correct = sum(m["correctness"] for m in test_eval_metrics)
+                test_accuracy = total_correct / len(test_eval_metrics)
+                test_avg_turns = sum(m["num_turns"] for m in test_eval_metrics) / len(test_eval_metrics)
+                logger.info(
+                    "[TEST EVAL] accuracy=%.3f (%s/%s), avg_interactions=%.2f",
+                    test_accuracy,
+                    int(total_correct),
+                    len(test_eval_metrics),
+                    test_avg_turns,
+                )
+                if args.wandb_project and wandb:
+                    wandb.log({
+                        "final_eval/test_accuracy": test_accuracy,
+                        "final_eval/test_avg_interactions": test_avg_turns,
+                    })
+
         if was_training:
             policy_model.train()
-
-        if eval_metrics:
-            total_correct = sum(m["correctness"] for m in eval_metrics)
-            eval_accuracy = total_correct / len(eval_metrics)
-            eval_avg_turns = sum(m["num_turns"] for m in eval_metrics) / len(eval_metrics)
-            logger.info(
-                "Evaluation episodes: accuracy=%.3f (%s/%s), avg_interactions=%.2f",
-                eval_accuracy,
-                int(total_correct),
-                len(eval_metrics),
-                eval_avg_turns,
-            )
 
     trainer.accelerator.wait_for_everyone()
     if getattr(trainer.accelerator, "is_main_process", True):
@@ -1538,6 +1619,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("AgentClinic PPO fine-tuning")
     parser.add_argument("--dataset_path", type=str, default="agentclinic_medqa.jsonl", help="Path to AgentClinic JSONL dataset")
     parser.add_argument("--max_scenarios", type=int, default=None, help="Optional cap on scenarios for quicker iterations")
+    parser.add_argument("--test_size", type=int, default=None, help="Number of scenarios to hold out for test set")
+    parser.add_argument("--test_ratio", type=float, default=None, help="Ratio of scenarios to hold out for test set (e.g., 0.2 for 20%)")
     parser.add_argument("--output_dir", type=str, default="outputs/ppo_run", help="Directory to store checkpoints and final policy")
     parser.add_argument("--base_model_name", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="Base HF model id for initialisation")
     parser.add_argument("--model_name", type=str, default=None, help="Optional SFT checkpoint to initialise from")
@@ -1610,8 +1693,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_fast_tokenizer", action="store_true", help="Force use of slow tokenizer implementation")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing on the policy model")
 
-    parser.add_argument("--batch_size", type=int, default=1, help="PPO batch size (currently forced to 1 by environment loop)")
-    parser.add_argument("--mini_batch_size", type=int, default=1, help="PPO mini-batch size (forced to 1)")
+    parser.add_argument("--batch_size", type=int, default=1, help="Number of episodes per PPO update (currently forced to 1; all turns within episode are batched together)")
+    parser.add_argument("--mini_batch_size", type=int, default=1, help="PPO mini-batch size (currently forced to 1)")
     parser.add_argument("--num_ppo_epochs", type=int, default=4, help="Number of PPO optimisation epochs per batch")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of passes over the scenario list")
     parser.add_argument("--learning_rate", type=float, default=1e-6)
@@ -1667,11 +1750,11 @@ def validate_args(args) -> None:
     if args.bf16 and args.fp16:
         raise ValueError("Only one of --bf16 or --fp16 can be specified.")
     if args.batch_size != 1:
-        logger.warning("Overriding batch_size=%s → 1 for sequential environment rollout", args.batch_size)
+        logger.warning("Overriding batch_size=%s → 1 (one episode per update; turns within episode are batched)", args.batch_size)
         args.batch_size = 1
     if args.mini_batch_size != 1:
         logger.warning(
-            "Overriding mini_batch_size=%s → 1 to match sequential environment rollout",
+            "Overriding mini_batch_size=%s → 1 (turns within episode are batched together)",
             args.mini_batch_size,
         )
         args.mini_batch_size = 1
@@ -1685,6 +1768,12 @@ def validate_args(args) -> None:
         raise ValueError("--save_total_limit must be non-negative")
     if args.temporal_decay_beta < 0:
         raise ValueError("--temporal_decay_beta must be non-negative")
+    if args.test_size is not None and args.test_ratio is not None:
+        raise ValueError("Cannot specify both --test_size and --test_ratio; choose one.")
+    if args.test_size is not None and args.test_size <= 0:
+        raise ValueError("--test_size must be positive")
+    if args.test_ratio is not None and (args.test_ratio <= 0 or args.test_ratio >= 1):
+        raise ValueError("--test_ratio must be between 0 and 1")
     for weight_name in (
         "budget_reward_weight",
         "question_reward_weight",
