@@ -52,6 +52,12 @@ def get_run_name(args, max_turns: int, mode: str) -> str:
             parts.append("corr_only")
         elif args.reward_sparse:
             parts.append("sparse")
+        elif args.reward_forward_sim:
+            parts.append("fwd_sim")
+            if args.intrinsic_token_weight != 0.001:  # Only add if non-default
+                parts.append(f"tw{args.intrinsic_token_weight}")
+            if args.intrinsic_turn_weight != 0.0:  # Only add if non-default
+                parts.append(f"turw{args.intrinsic_turn_weight}")
         else:
             parts.extend([
                 f"dw{args.diagnosis_reward_weight}",
@@ -108,9 +114,11 @@ def sweep_training(args, max_turns_values: List[int]) -> Dict[int, Dict[str, Any
             cmd.append("--reward_correctness_baseline")
         if args.reward_sparse:
             cmd.append("--reward_sparse")
-        if args.wandb_project:
-            cmd.extend(["--wandb_project", args.wandb_project])
-            cmd.extend(["--run_name", run_name])
+        if args.reward_forward_sim:
+            cmd.append("--reward_forward_sim")
+            cmd.extend(["--intrinsic_token_weight", str(args.intrinsic_token_weight)])
+            cmd.extend(["--intrinsic_turn_weight", str(args.intrinsic_turn_weight)])
+            cmd.extend(["--forward_sim_temperature", str(args.forward_sim_temperature)])
 
         exit_code = run_command(
             cmd,
@@ -176,6 +184,11 @@ def sweep_evaluation(args, max_turns_values: List[int]) -> Dict[int, Dict[str, A
             cmd.append("--reward_correctness_baseline")
         if args.reward_sparse:
             cmd.append("--reward_sparse")
+        if args.reward_forward_sim:
+            cmd.append("--reward_forward_sim")
+            cmd.extend(["--intrinsic_token_weight", str(args.intrinsic_token_weight)])
+            cmd.extend(["--intrinsic_turn_weight", str(args.intrinsic_turn_weight)])
+            cmd.extend(["--forward_sim_temperature", str(args.forward_sim_temperature)])
 
         exit_code = run_command(
             cmd,
@@ -249,13 +262,16 @@ def main():
     parser.add_argument("--question_reward_weight", type=float, default=1.0)
     parser.add_argument("--reward_correctness_baseline", action="store_true")
     parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward (standard RL)")
+    parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards")
+    parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token")
+    parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn")
+    parser.add_argument("--forward_sim_temperature", type=float, default=0.0, help="Temperature for forward simulation")
 
     # Evaluation parameters
     parser.add_argument("--eval_train", action="store_true")
 
     # Other
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb_project", type=str, default=None)
 
     args = parser.parse_args()
 

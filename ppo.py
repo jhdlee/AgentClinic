@@ -48,12 +48,6 @@ from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 
 from peft import LoraConfig, get_peft_model
 
-try:  # Optional logging backend
-    import wandb
-except ImportError:  # pragma: no cover - optional dependency
-    wandb = None  # type: ignore
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -491,6 +485,10 @@ class AgentClinicSimulator:
         reward_breakdown_debug: bool = False,
         reward_correctness_baseline: bool = False,
         reward_sparse: bool = False,
+        reward_forward_sim: bool = False,
+        intrinsic_token_weight: float = 0.0,
+        intrinsic_turn_weight: float = 0.0,
+        forward_sim_temperature: float = 0.0,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -514,6 +512,10 @@ class AgentClinicSimulator:
         self.reward_breakdown_debug = reward_breakdown_debug
         self.reward_correctness_baseline = reward_correctness_baseline
         self.reward_sparse = reward_sparse
+        self.reward_forward_sim = reward_forward_sim
+        self.intrinsic_token_weight = float(intrinsic_token_weight)
+        self.intrinsic_turn_weight = float(intrinsic_turn_weight)
+        self.forward_sim_temperature = float(forward_sim_temperature)
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -717,6 +719,79 @@ class AgentClinicSimulator:
         ]
 
         correctness, moderator_decision = self._evaluate_correctness(state)
+
+        # Forward simulation reward: per-turn extrinsic + intrinsic rewards
+        if self.reward_forward_sim:
+            per_turn_rewards = []
+            forward_sim_correctness = []
+
+            for turn_idx, turn in enumerate(state.turns):
+                # Extrinsic reward: forward simulate from this turn
+                extrinsic_correctness = self._forward_simulate_from_turn(
+                    state, turn_idx, generate_fn
+                )
+                forward_sim_correctness.append(extrinsic_correctness)
+
+                # Intrinsic reward: token count + turn penalty
+                token_count = len(turn.response_tensor)
+                intrinsic_reward = (
+                    -token_count * self.intrinsic_token_weight
+                    - self.intrinsic_turn_weight
+                )
+
+                # Combined reward for this turn
+                turn_reward = (
+                    self.diagnosis_reward_weight * extrinsic_correctness
+                    + intrinsic_reward
+                )
+                per_turn_rewards.append(turn_reward)
+
+                # Store breakdown
+                per_turn_components[turn_idx] = {
+                    "diagnosis": self.diagnosis_reward_weight * extrinsic_correctness,
+                    "budget": 0.0,  # Not used in forward sim mode
+                    "question": intrinsic_reward,
+                }
+
+            reward = sum(per_turn_rewards)
+
+            if self.debug_print or self.reward_breakdown_debug:
+                print(
+                    f"[Episode {state.scenario_id}] Forward sim reward | "
+                    f"actual_correctness={correctness:.3f} | "
+                    f"avg_forward_sim_correctness={sum(forward_sim_correctness)/len(forward_sim_correctness):.3f} | "
+                    f"intrinsic_token_weight={self.intrinsic_token_weight:.4f} | "
+                    f"intrinsic_turn_weight={self.intrinsic_turn_weight:.4f} | "
+                    f"total={reward:.3f}"
+                )
+                if per_turn_components:
+                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (forward sim):")
+                    for idx, (turn, components, total, fwd_corr) in enumerate(
+                        zip(state.turns, per_turn_components, per_turn_rewards, forward_sim_correctness), start=1
+                    ):
+                        print(
+                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
+                            "forward_sim_correctness={fwd_corr:.3f} | "
+                            "extrinsic={extrin:.3f} | intrinsic={intrin:.3f} | tokens={tokens}".format(
+                                turn_idx=idx,
+                                action=turn.action.type,
+                                total=total,
+                                fwd_corr=fwd_corr,
+                                extrin=components["diagnosis"],
+                                intrin=components["question"],
+                                tokens=len(turn.response_tensor),
+                            )
+                        )
+
+            return reward, {
+                "correctness": correctness,
+                "budget_saved": state.remaining_budget / float(max(state.max_turns, 1)),
+                "question_reward": sum(c["question"] for c in per_turn_components),
+                "moderator_decision": moderator_decision,
+                "reward_per_turn": per_turn_rewards,
+                "reward_breakdown_per_turn": per_turn_components,
+                "forward_sim_correctness_avg": sum(forward_sim_correctness) / len(forward_sim_correctness) if forward_sim_correctness else 0.0,
+            }
 
         # Sparse reward: only diagnosis turn gets substantial reward, questions get small cost
         if self.reward_sparse:
@@ -1063,6 +1138,145 @@ class AgentClinicSimulator:
 
         return 0.0
 
+    def _forward_simulate_from_turn(
+        self,
+        original_state: DoctorEpisodeState,
+        turn_idx: int,
+        generate_fn,
+    ) -> float:
+        """
+        Forward simulate episode from turn_idx to get expected correctness.
+
+        This implements per-turn credit assignment by simulating what happens
+        if we start from this turn and continue to the end.
+
+        Process:
+        1. Create fresh state for same scenario
+        2. Replay turns [0, turn_idx] with exact same doctor actions
+        3. Generate fresh turns [turn_idx+1, ...] until diagnosis (deterministic)
+        4. Return final correctness
+
+        Args:
+            original_state: Completed episode state with all turns
+            turn_idx: Turn index to simulate from (0-indexed)
+            generate_fn: Generation function that takes (prompt, scenario_id, turn_idx)
+
+        Returns:
+            Correctness (0.0 or 1.0) of forward-simulated episode
+        """
+        # Create fresh state for same scenario
+        sim_state = self.reset(original_state.scenario)
+
+        # Replay turns [0, turn_idx] with exact same doctor actions
+        for replay_idx in range(turn_idx + 1):
+            if replay_idx >= len(original_state.turns):
+                # Safety: should not happen
+                break
+
+            original_turn = original_state.turns[replay_idx]
+            original_action = original_turn.action
+
+            # Capture state before this turn
+            history_before = [dict(turn) for turn in sim_state.history]
+            patient_hist_before = sim_state.patient_agent.get_hist()
+            measurement_hist_before = sim_state.measurement_agent.get_hist()
+            remaining_budget_before = sim_state.remaining_budget
+
+            # Build prompt for this turn (returns tuple: prompt, system_prompt)
+            prev_role = sim_state.history[-1]["role"] if sim_state.history else None
+            prev_text = sim_state.history[-1]["content"] if sim_state.history else None
+            prompt_str, system_prompt_str = self.build_prompt(sim_state, prev_role, prev_text)
+
+            # Apply the action to get patient/measurement response
+            reply_role, reply_text = self._apply_action(sim_state, original_action)
+
+            # Store the turn with all required fields
+            sim_state.turns.append(
+                EpisodeTurn(
+                    prompt=prompt_str,
+                    doctor_text=original_action.text,
+                    query_tensor=original_turn.query_tensor,  # Reuse from original
+                    response_tensor=original_turn.response_tensor,  # Reuse from original
+                    action=original_action,
+                    reply_role=reply_role,
+                    reply_text=reply_text,
+                    history_before=history_before,
+                    patient_hist_before=patient_hist_before,
+                    measurement_hist_before=measurement_hist_before,
+                    remaining_budget_before=remaining_budget_before,
+                )
+            )
+
+            # If this was the diagnosis action, we're done with replay
+            if original_action.type == "diagnosis":
+                break
+
+        # If we're at the last turn of original episode, no need to continue
+        if turn_idx >= len(original_state.turns) - 1:
+            # Just evaluate correctness of replayed diagnosis
+            correctness, _ = self._evaluate_correctness(sim_state)
+            return correctness
+
+        # Continue generating fresh turns from turn_idx+1 until diagnosis
+        # Use deterministic generation (temperature controlled by forward_sim_temperature)
+        max_additional_turns = sim_state.max_turns - len(sim_state.actions)
+
+        for _ in range(max_additional_turns):
+            if sim_state.done:
+                break
+
+            # Capture state before this turn
+            history_before = [dict(turn) for turn in sim_state.history]
+            patient_hist_before = sim_state.patient_agent.get_hist()
+            measurement_hist_before = sim_state.measurement_agent.get_hist()
+            remaining_budget_before = sim_state.remaining_budget
+
+            # Get last reply for context
+            prev_role = sim_state.history[-1]["role"] if sim_state.history else None
+            prev_text = sim_state.history[-1]["content"] if sim_state.history else None
+
+            # Build prompt (returns tuple: prompt, system_prompt)
+            prompt_str, system_prompt_str = self.build_prompt(sim_state, prev_role, prev_text)
+            model_input = self._format_model_input(system_prompt_str, prompt_str)
+
+            # Generate with deterministic temperature
+            # Note: generate_fn uses the configured temperature
+            query_tensor, response_tensor, doctor_response = generate_fn(
+                model_input,
+                scenario_id=sim_state.scenario_id,
+                turn_idx=len(sim_state.actions),
+            )
+
+            # Parse action
+            action = parse_action(doctor_response)
+
+            # Apply action
+            reply_role, reply_text = self._apply_action(sim_state, action)
+
+            # Store turn with all required fields
+            sim_state.turns.append(
+                EpisodeTurn(
+                    prompt=prompt_str,
+                    doctor_text=doctor_response,
+                    query_tensor=query_tensor,
+                    response_tensor=response_tensor,
+                    action=action,
+                    reply_role=reply_role,
+                    reply_text=reply_text,
+                    history_before=history_before,
+                    patient_hist_before=patient_hist_before,
+                    measurement_hist_before=measurement_hist_before,
+                    remaining_budget_before=remaining_budget_before,
+                )
+            )
+
+            if sim_state.done:
+                break
+
+        # Evaluate final correctness
+        correctness, _ = self._evaluate_correctness(sim_state)
+        return correctness
+
     def _evaluate_correctness(
         self, state: DoctorEpisodeState
     ) -> Tuple[float, str]:
@@ -1357,6 +1571,10 @@ def train(args) -> None:
         reward_breakdown_debug=args.print_reward_breakdown or args.debug_print,
         reward_correctness_baseline=args.reward_correctness_baseline,
         reward_sparse=args.reward_sparse,
+        reward_forward_sim=args.reward_forward_sim,
+        intrinsic_token_weight=args.intrinsic_token_weight,
+        intrinsic_turn_weight=args.intrinsic_turn_weight,
+        forward_sim_temperature=args.forward_sim_temperature,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1386,17 +1604,6 @@ def train(args) -> None:
 
     generation_kwargs = prepare_generation_kwargs(args, tokenizer)
     checkpoint_manager = CheckpointManager(output_dir, args.save_total_limit)
-
-    if args.wandb_project:
-        if wandb is None:
-            logger.warning("Weights & Biases logging requested but wandb is not installed.")
-        else:
-            wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                name=args.run_name or os.path.basename(output_dir),
-                config=vars(args),
-            )
 
     device = trainer.accelerator.device
     policy_model = trainer.accelerator.unwrap_model(trainer.model).pretrained_model
@@ -1449,19 +1656,14 @@ def train(args) -> None:
         #         print("[System Prompt]\n" + system_prompt_text, flush=True)
         #     print("[Prompt]\n" + user_prompt_text, flush=True)
 
-        was_training = policy_model.training
-        if was_training:
-            policy_model.eval()
-
+        # Keep model in training mode during PPO rollout (following CollabLLM)
+        # This ensures policy consistency between data collection and optimization
         with torch.no_grad():
             output_tensors = policy_model.generate(
                 query_tensors,
                 attention_mask=attention_mask,
                 **generation_kwargs,
             )
-
-        if was_training:
-            policy_model.train()
 
         generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
         if generated_tokens.shape[-1] == 0:
@@ -1478,6 +1680,9 @@ def train(args) -> None:
     stop_training = False
     episode_metrics: List[Dict[str, float]] = []
     epoch_stats: List[Dict[str, Any]] = []  # Track stats per epoch
+
+    # Ensure model is in training mode for PPO (following CollabLLM)
+    policy_model.train()
 
     for epoch in range(args.num_train_epochs):
         scenario_indices = train_indices.copy()
@@ -1614,14 +1819,6 @@ def train(args) -> None:
                 epoch_avg_interactions,
             )
 
-            if trainer.accelerator.is_main_process and args.wandb_project and wandb:
-                wandb.log({
-                    "epoch/avg_reward": epoch_avg_reward,
-                    "epoch/avg_accuracy": epoch_avg_accuracy,
-                    "epoch/avg_interactions": epoch_avg_interactions,
-                    "epoch/num": epoch + 1,
-                })
-
         if stop_training:
             break
 
@@ -1666,11 +1863,6 @@ def train(args) -> None:
                 len(train_eval_metrics),
                 train_avg_turns,
             )
-            if args.wandb_project and wandb:
-                wandb.log({
-                    "final_eval/train_accuracy": train_accuracy,
-                    "final_eval/train_avg_interactions": train_avg_turns,
-                })
 
         # Evaluate on test set if available
         if test_indices:
@@ -1696,11 +1888,6 @@ def train(args) -> None:
                     len(test_eval_metrics),
                     test_avg_turns,
                 )
-                if args.wandb_project and wandb:
-                    wandb.log({
-                        "final_eval/test_accuracy": test_accuracy,
-                        "final_eval/test_avg_interactions": test_avg_turns,
-                    })
 
         # Save final evaluation results in standard format for sweep compatibility
         eval_results_summary = {}
@@ -1741,9 +1928,6 @@ def train(args) -> None:
             with open(stats_path, "w", encoding="utf-8") as f:
                 json.dump(epoch_stats, f, indent=2)
             logger.info("Saved epoch statistics to %s", stats_path)
-
-    if args.wandb_project and wandb:
-        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -1858,6 +2042,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
     parser.add_argument("--reward_correctness_baseline", action="store_true", help="Use only diagnosis correctness as reward for every turn")
     parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost (more standard RL)")
+    parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards: per-turn extrinsic (forward sim correctness) + intrinsic (token/turn penalties)")
+    parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward (e.g., 0.001)")
+    parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")
+    parser.add_argument("--forward_sim_temperature", type=float, default=0.0, help="Temperature for forward simulation (0.0 = deterministic)")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -1865,10 +2053,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_total_limit", type=int, default=5, help="Maximum number of saved checkpoints (excluding final)")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Optional cap on PPO updates")
     parser.add_argument("--max_episodes", type=int, default=None, help="Optional cap on completed episodes")
-
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--run_name", type=str, default=None)
 
     parser.add_argument("--config_file", type=str, default=None, help="JSON or YAML file with argument overrides")
     parser.add_argument("--log_level", type=str, default="INFO")

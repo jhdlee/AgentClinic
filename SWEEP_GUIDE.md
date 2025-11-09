@@ -89,6 +89,15 @@ The sweep script automatically creates informative directory names based on hype
   - max_turns=5
   - 4-bit quantization
 
+- `train_mt4_lr1e-05_ep50_fwd_sim_lora_4bit`
+  - Training mode
+  - max_turns=4
+  - learning_rate=1e-05
+  - 50 epochs
+  - Forward simulation reward (with default intrinsic weights)
+  - LoRA enabled
+  - 4-bit quantization
+
 ## Plots Generated
 
 The plotting script creates two side-by-side plots:
@@ -116,8 +125,7 @@ python sweep_max_turns.py \
     --diagnosis_reward_weight 2.0 \
     --budget_reward_weight 0.5 \
     --question_reward_weight 1.0 \
-    --test_size 50 \
-    --wandb_project my_project
+    --test_size 50
 ```
 
 ### Reward Modes
@@ -154,6 +162,24 @@ Without either flag, uses dense reward shaping with:
 - Question utility (temporally weighted)
 - Budget efficiency
 - Diagnosis correctness
+
+**Forward Simulation Reward**:
+Use `--reward_forward_sim` for per-turn credit assignment via forward simulation:
+- For each doctor turn: forward simulate to episode end and compute extrinsic reward (diagnosis correctness)
+- Add intrinsic rewards: token count penalty + turn penalty
+- Combined: `r_t = diagnosis_weight * extrinsic_correctness_t + intrinsic_t`
+- Note: This is 3-4x slower due to O(N²) forward simulations
+
+```bash
+python sweep_max_turns.py \
+    --mode train \
+    --max_turns_range 2 3 4 5 \
+    --reward_forward_sim \
+    --intrinsic_token_weight 0.001 \
+    --intrinsic_turn_weight 0.0 \
+    --forward_sim_temperature 0.0 \
+    --test_size 20
+```
 
 ### Continue on Error
 
@@ -238,10 +264,9 @@ python plot_sweep.py --results_dir outputs/trained
 ## Tips
 
 1. **Start small**: Test with `--max_scenarios 10` first
-2. **Use WandB**: Add `--wandb_project your_project` to track all runs
-3. **Save compute**: Use `--use_4bit` for faster experiments
-4. **Test range**: Try `--max_turns_range 2 3 4 5 6 7 8` to find optimal budget
-5. **Check results early**: Each run saves `evaluation_results.json` immediately
+2. **Save compute**: Use `--use_4bit` for faster experiments
+3. **Test range**: Try `--max_turns_range 2 3 4 5 6 7 8` to find optimal budget
+4. **Check results early**: Each run saves `evaluation_results.json` immediately
 
 ## Troubleshooting
 

@@ -107,6 +107,10 @@ def evaluate(args) -> None:
         reward_breakdown_debug=args.print_reward_breakdown,
         reward_correctness_baseline=args.reward_correctness_baseline,
         reward_sparse=args.reward_sparse,
+        reward_forward_sim=args.reward_forward_sim,
+        intrinsic_token_weight=args.intrinsic_token_weight,
+        intrinsic_turn_weight=args.intrinsic_turn_weight,
+        forward_sim_temperature=args.forward_sim_temperature,
     )
 
     # Load model
@@ -369,6 +373,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print_reward_breakdown", action="store_true")
     parser.add_argument("--reward_correctness_baseline", action="store_true")
     parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost")
+    parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards: per-turn extrinsic (forward sim correctness) + intrinsic (token/turn penalties)")
+    parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward")
+    parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")
+    parser.add_argument("--forward_sim_temperature", type=float, default=0.0, help="Temperature for forward simulation (0.0 = deterministic)")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_level", type=str, default="INFO")
