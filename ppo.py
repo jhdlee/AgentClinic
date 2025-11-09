@@ -673,19 +673,21 @@ class AgentClinicSimulator:
 
         if total_questions > 0 and self.question_reward_weight != 0.0:
             question_counter = 0
-            for idx, action in enumerate(state.actions):
+            for idx, turn in enumerate(state.turns):
+                action = turn.action
                 if action.type == "diagnosis":
                     continue
                 question_counter += 1
                 base = max((total_questions - question_counter) / total_questions, 0.0)
                 temporal_weight = base ** self.temporal_decay_beta
                 try:
-                    utility = self._question_counterfactual_utility(
-                        state,
-                        idx,
-                        generate_fn,
-                        action,
-                        correctness,
+                    if self.debug_print:
+                        print(f"Computing question confidence gain for turn {idx + 1} of {total_questions}")
+                    utility = self._question_confidence_gain(
+                        state=state,
+                        turn=turn,
+                        turn_idx=idx,
+                        generate_fn=generate_fn,
                     )
                 except Exception as exc:
                     utility = 0.0
@@ -718,121 +720,161 @@ class AgentClinicSimulator:
             "moderator_decision": moderator_decision,
         }
 
-    def _question_counterfactual_utility(
+    def _question_confidence_gain(
         self,
         state: DoctorEpisodeState,
-        question_idx: int,
+        turn: EpisodeTurn,
+        turn_idx: int,
         generate_fn,
-        action: DoctorAction,
-        correctness_actual: float,
     ) -> float:
-        counterfactual_correctness = self._simulate_counterfactual_correctness(
-            state, question_idx, generate_fn, action
+        history_before = turn.history_before
+        history_after = copy.deepcopy(history_before)
+        history_after.append({"role": "doctor", "content": turn.action.text})
+        if turn.reply_role and turn.reply_text:
+            history_after.append({"role": turn.reply_role, "content": turn.reply_text})
+
+        before_confidence = self._diagnosis_confidence_from_history(
+            state=state,
+            history=history_before,
+            generate_fn=generate_fn,
+            scenario_id=state.scenario_id,
+            turn_idx=turn_idx,
+            probe_label="before",
         )
-        utility = correctness_actual - counterfactual_correctness
+        after_confidence = self._diagnosis_confidence_from_history(
+            state=state,
+            history=history_after,
+            generate_fn=generate_fn,
+            scenario_id=state.scenario_id,
+            turn_idx=turn_idx,
+            probe_label="after",
+        )
+
+        gain = after_confidence - before_confidence
         if self.debug_print:
             print(
-                f"[Episode {state.scenario_id}] Counterfactual utility | "
-                f"Q{question_idx + 1}: \"{action.text}\" | "
-                f"actual={correctness_actual:.3f} | "
-                f"counterfactual={counterfactual_correctness:.3f} | "
-                f"utility={utility:.3f}"
+                f"[Episode {state.scenario_id}] Confidence delta | "
+                f"turn={turn_idx + 1} type={turn.action.type} | "
+                f"before={before_confidence:.3f} | "
+                f"after={after_confidence:.3f} | "
+                f"gain={gain:.3f}"
             )
-        return utility
+        return gain
 
-    def _simulate_counterfactual_correctness(
+    def _diagnosis_confidence_from_history(
         self,
         state: DoctorEpisodeState,
-        question_idx: int,
+        history: Sequence[Dict[str, str]],
         generate_fn,
-        action: DoctorAction,
+        scenario_id: Optional[int],
+        turn_idx: Optional[int],
+        probe_label: str,
     ) -> float:
-        turn = state.turns[question_idx]
-        restored_state = self._restore_state_from_snapshot(state, question_idx, turn)
-        banned_questions = [action.text]
-        self._rollout_from_state(
-            restored_state,
-            generate_fn,
-            forbidden_questions=banned_questions,
+        system_prompt, prompt = self._build_diagnosis_assessment_query(state, history)
+        model_input = self._format_model_input(system_prompt, prompt)
+        _, _, response_text = generate_fn(
+            model_input,
+            scenario_id=scenario_id,
+            turn_idx=turn_idx,
         )
-        correctness, _ = self._evaluate_correctness(restored_state)
-        return correctness
+        confidence = self._parse_confidence_response(response_text)
+        if self.debug_print:
+            print(
+                f"[Episode {scenario_id}] Confidence probe ({probe_label}) -> "
+                f"{confidence:.3f}"
+            )
+        return confidence
 
-    def _restore_state_from_snapshot(
-        self,
-        original_state: DoctorEpisodeState,
-        question_idx: int,
-        turn: EpisodeTurn,
-    ) -> DoctorEpisodeState:
-        previous_state = getattr(self, "state", None)
-        restored_state = self.reset(original_state.scenario)
-        self.state = previous_state
-
-        restored_state.history = copy.deepcopy(turn.history_before)
-        restored_state.actions = copy.deepcopy(original_state.actions[:question_idx])
-        restored_state.turns = []
-        restored_state.remaining_budget = turn.remaining_budget_before
-        restored_state.diagnosis_action = None
-        restored_state.done = False
-        restored_state.patient_agent.agent_hist = turn.patient_hist_before
-        restored_state.measurement_agent.agent_hist = turn.measurement_hist_before
-        return restored_state
-
-    def _rollout_from_state(
+    def _build_diagnosis_assessment_query(
         self,
         state: DoctorEpisodeState,
-        generate_fn,
-        forbidden_questions: Optional[Sequence[str]] = None,
-    ) -> None:
-        forbidden_questions = list(forbidden_questions or [])
-        forbidden_norm = {normalize_text(q) for q in forbidden_questions}
+        history: Sequence[Dict[str, str]],
+    ) -> Tuple[str, str]:
+        examiner_context = _stringify_context(state.scenario.examiner_information())
+        history_text = self._format_history_for_prompt(history)
 
-        previous_reply_role = None
-        previous_reply_text = None
-        while not state.done:
-            prompt, system_prompt = self.build_prompt(
-                state,
-                previous_reply_role,
-                previous_reply_text,
-                forbidden_questions,
-            )
-            model_input = self._format_model_input(system_prompt, prompt)
-            attempts = 0
-            while True:
-                _, _, doctor_response = generate_fn(
-                    model_input,
-                    scenario_id=state.scenario_id,
-                    turn_idx=len(state.turns),
-                )
-                normalized = normalize_text(doctor_response)
+        system_prompt = (
+            "You are Dr. Agent reviewing an ongoing patient encounter. "
+            "Based solely on the conversation so far, provide your single best "
+            "tentative diagnosis, after first explaining the reasoning for your diagnosis, and estimate your confidence as a probability "
+            "between 0 and 1. Respond ONLY with a JSON object containing the keys "
+            "\"diagnosis\", \"reasoning\", and \"confidence\"."
+        )
+        prompt_parts = [
+            "Examiner guidance:",
+            examiner_context or "None provided.",
+            "",
+            "Conversation transcript:",
+            history_text or "No dialogue yet.",
+            "",
+            "Provide your current assessment now.",
+        ]
+        prompt = "\n".join(prompt_parts)
+        return system_prompt, prompt
 
-                # TODO: need a better way to check for the equivalency of the questions
-                if forbidden_norm and normalized in forbidden_norm: 
-                    attempts += 1
-                    if attempts >= self.forbidden_retry_limit:
-                        if self.debug_print:
-                            print(
-                                f"[Episode {state.scenario_id}] Aborting counterfactual rollout after {attempts} repeated forbidden question attempts."
-                            )
-                        return
-                    prompt = prompt + (
-                        "\n\nReminder: Do not repeat the question \""
-                        + doctor_response
-                        + "\". Ask something different or provide a diagnosis."
-                    )
-                    model_input = self._format_model_input(system_prompt, prompt)
-                    if self.debug_print:
-                        print(
-                            f"[Episode {state.scenario_id}] Counterfactual rollout rejected forbidden question repeat \"{doctor_response}\" (attempt {attempts})."
-                        )
-                    continue
-                break
+    @staticmethod
+    def _format_history_for_prompt(history: Sequence[Dict[str, str]]) -> str:
+        if not history:
+            return ""
+        lines: List[str] = []
+        for turn in history:
+            role = turn.get("role", "").capitalize() or "Unknown"
+            content = turn.get("content", "")
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines)
 
-            action = parse_action(doctor_response)
-            reply_role, reply_text = self._apply_action(state, action)
+    @staticmethod
+    def _clamp_probability(value: float) -> float:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if value != value:  # NaN check
+            return 0.0
+        return max(0.0, min(1.0, value))
 
-            previous_reply_role = reply_role
-            previous_reply_text = reply_text
+    @staticmethod
+    def _parse_confidence_response(text: str) -> float:
+        if not text:
+            return 0.0
+        cleaned = text.strip()
+
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if json_match:
+            try:
+                payload = json.loads(json_match.group(0))
+                confidence_value = payload.get("confidence")
+                if confidence_value is not None:
+                    value = float(confidence_value)
+                    if abs(value) > 1.0:
+                        value /= 100.0
+                    return AgentClinicSimulator._clamp_probability(value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        key_match = re.search(
+            r"confidence[^0-9\-]*(-?\d+(?:\.\d+)?)", cleaned, re.IGNORECASE
+        )
+        if key_match:
+            try:
+                value = float(key_match.group(1))
+                if abs(value) > 1.0:
+                    value /= 100.0
+                return AgentClinicSimulator._clamp_probability(value)
+            except ValueError:
+                pass
+
+        number_match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if number_match:
+            try:
+                value = float(number_match.group(0))
+                if abs(value) > 1.0:
+                    value /= 100.0
+                return AgentClinicSimulator._clamp_probability(value)
+            except ValueError:
+                pass
+
+        return 0.0
 
     def _evaluate_correctness(
         self, state: DoctorEpisodeState
