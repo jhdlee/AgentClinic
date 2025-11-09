@@ -1410,11 +1410,16 @@ def train(args) -> None:
     episodes_completed = 0
     stop_training = False
     episode_metrics: List[Dict[str, float]] = []
+    epoch_stats: List[Dict[str, Any]] = []  # Track stats per epoch
 
     for epoch in range(args.num_train_epochs):
         scenario_indices = train_indices.copy()
         # random.shuffle(scenario_indices)
         logger.info("Starting epoch %s with %s training scenarios", epoch + 1, len(scenario_indices))
+
+        epoch_rewards: List[float] = []
+        epoch_correctness: List[float] = []
+        epoch_turns: List[int] = []
 
         for scenario_idx in scenario_indices:
             state, episode_info = simulator.run_episode(scenario_idx, generate_response)
@@ -1481,12 +1486,18 @@ def train(args) -> None:
             global_step += len(turns)
             episodes_completed += 1
 
+            # Track overall metrics
             episode_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
                     "num_turns": len(turns),
                 }
             )
+
+            # Track epoch-level metrics
+            epoch_rewards.append(reward_value)
+            epoch_correctness.append(episode_info.get("correctness", 0.0))
+            epoch_turns.append(len(turns))
 
             if args.logging_steps and global_step % args.logging_steps == 0:
                 logger.info(
@@ -1512,6 +1523,37 @@ def train(args) -> None:
 
             if stop_training:
                 break
+
+        # Compute and log epoch-level statistics
+        if epoch_rewards:
+            epoch_avg_reward = sum(epoch_rewards) / len(epoch_rewards)
+            epoch_avg_accuracy = sum(epoch_correctness) / len(epoch_correctness)
+            epoch_avg_interactions = sum(epoch_turns) / len(epoch_turns)
+
+            epoch_stat = {
+                "epoch": epoch + 1,
+                "avg_reward": epoch_avg_reward,
+                "avg_accuracy": epoch_avg_accuracy,
+                "avg_interactions": epoch_avg_interactions,
+                "num_episodes": len(epoch_rewards),
+            }
+            epoch_stats.append(epoch_stat)
+
+            logger.info(
+                "Epoch %d summary: avg_reward=%.3f, avg_accuracy=%.3f, avg_interactions=%.2f",
+                epoch + 1,
+                epoch_avg_reward,
+                epoch_avg_accuracy,
+                epoch_avg_interactions,
+            )
+
+            if trainer.accelerator.is_main_process and args.wandb_project and wandb:
+                wandb.log({
+                    "epoch/avg_reward": epoch_avg_reward,
+                    "epoch/avg_accuracy": epoch_avg_accuracy,
+                    "epoch/avg_interactions": epoch_avg_interactions,
+                    "epoch/num": epoch + 1,
+                })
 
         if stop_training:
             break
@@ -1601,6 +1643,13 @@ def train(args) -> None:
         trainer.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
         logger.info("Saved final policy and tokenizer to %s", output_dir)
+
+        # Save epoch statistics to JSON file for later analysis/plotting
+        if epoch_stats:
+            stats_path = os.path.join(output_dir, "epoch_stats.json")
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(epoch_stats, f, indent=2)
+            logger.info("Saved epoch statistics to %s", stats_path)
 
     if args.wandb_project and wandb:
         wandb.finish()
