@@ -50,6 +50,8 @@ def get_run_name(args, max_turns: int, mode: str) -> str:
 
         if args.reward_correctness_baseline:
             parts.append("corr_only")
+        elif args.reward_sparse:
+            parts.append("sparse")
         else:
             parts.extend([
                 f"dw{args.diagnosis_reward_weight}",
@@ -104,6 +106,8 @@ def sweep_training(args, max_turns_values: List[int]) -> Dict[int, Dict[str, Any
             cmd.append("--disable_reference_model")
         if args.reward_correctness_baseline:
             cmd.append("--reward_correctness_baseline")
+        if args.reward_sparse:
+            cmd.append("--reward_sparse")
         if args.wandb_project:
             cmd.extend(["--wandb_project", args.wandb_project])
             cmd.extend(["--run_name", run_name])
@@ -170,6 +174,8 @@ def sweep_evaluation(args, max_turns_values: List[int]) -> Dict[int, Dict[str, A
             cmd.append("--eval_train")
         if args.reward_correctness_baseline:
             cmd.append("--reward_correctness_baseline")
+        if args.reward_sparse:
+            cmd.append("--reward_sparse")
 
         exit_code = run_command(
             cmd,
@@ -242,6 +248,7 @@ def main():
     parser.add_argument("--budget_reward_weight", type=float, default=1.0)
     parser.add_argument("--question_reward_weight", type=float, default=1.0)
     parser.add_argument("--reward_correctness_baseline", action="store_true")
+    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward (standard RL)")
 
     # Evaluation parameters
     parser.add_argument("--eval_train", action="store_true")

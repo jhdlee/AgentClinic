@@ -490,6 +490,7 @@ class AgentClinicSimulator:
         debug_print: bool = False,
         reward_breakdown_debug: bool = False,
         reward_correctness_baseline: bool = False,
+        reward_sparse: bool = False,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -512,6 +513,7 @@ class AgentClinicSimulator:
         self.debug_print = debug_print
         self.reward_breakdown_debug = reward_breakdown_debug
         self.reward_correctness_baseline = reward_correctness_baseline
+        self.reward_sparse = reward_sparse
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -716,6 +718,68 @@ class AgentClinicSimulator:
 
         correctness, moderator_decision = self._evaluate_correctness(state)
 
+        # Sparse reward: only diagnosis turn gets substantial reward, questions get small cost
+        if self.reward_sparse:
+            budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
+            diagnosis_component = self.diagnosis_reward_weight * correctness
+            budget_component = self.budget_reward_weight * budget_fraction
+            diagnosis_reward = diagnosis_component + budget_component
+
+            per_turn_rewards = []
+            for turn in state.turns:
+                if turn.action.type == "diagnosis":
+                    # Diagnosis turn gets full reward
+                    per_turn_rewards.append(diagnosis_reward)
+                    per_turn_components[len(per_turn_rewards) - 1] = {
+                        "diagnosis": diagnosis_component,
+                        "budget": budget_component,
+                        "question": 0.0,
+                    }
+                else:
+                    # Question turns get small cost (negative reward encourages efficiency)
+                    question_penalty = -self.question_cost
+                    per_turn_rewards.append(question_penalty)
+                    per_turn_components[len(per_turn_rewards) - 1] = {
+                        "diagnosis": 0.0,
+                        "budget": 0.0,
+                        "question": question_penalty,
+                    }
+
+            reward = sum(per_turn_rewards)
+
+            if self.debug_print or self.reward_breakdown_debug:
+                print(
+                    f"[Episode {state.scenario_id}] Sparse reward | "
+                    f"correctness={correctness:.3f} (w={self.diagnosis_reward_weight}) | "
+                    f"budget={budget_fraction:.3f} (w={self.budget_reward_weight}) | "
+                    f"question_cost={self.question_cost:.3f} | total={reward:.3f}"
+                )
+                if per_turn_components:
+                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (sparse):")
+                    for idx, (turn, components, total) in enumerate(
+                        zip(state.turns, per_turn_components, per_turn_rewards), start=1
+                    ):
+                        print(
+                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
+                            "diagnosis={diag:.3f} | budget={budget:.3f} | question={q:.3f}".format(
+                                turn_idx=idx,
+                                action=turn.action.type,
+                                total=total,
+                                diag=components["diagnosis"],
+                                budget=components["budget"],
+                                q=components["question"],
+                            )
+                        )
+
+            return reward, {
+                "correctness": correctness,
+                "budget_saved": budget_fraction,
+                "question_reward": sum(r for r in per_turn_rewards if r < 0),
+                "moderator_decision": moderator_decision,
+                "reward_per_turn": per_turn_rewards,
+                "reward_breakdown_per_turn": per_turn_components,
+            }
+
         if self.reward_correctness_baseline:
             diagnosis_component = self.diagnosis_reward_weight * correctness
             per_turn_components = [
@@ -760,7 +824,7 @@ class AgentClinicSimulator:
                 action = turn.action
                 if action.type == "diagnosis":
                     continue
-                question_counter += 1
+                # Use counter BEFORE incrementing (0-indexed: first question gets i=0)
                 base = max((total_questions - question_counter) / total_questions, 0.0)
                 temporal_weight = base ** self.temporal_decay_beta
                 try:
@@ -786,6 +850,8 @@ class AgentClinicSimulator:
                     per_turn_components[idx]["question"] += (
                         self.question_reward_weight * question_component
                     )
+                # Increment counter AFTER computing weight (moves to next 0-indexed position)
+                question_counter += 1
 
         budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
         diagnosis_component = self.diagnosis_reward_weight * correctness
@@ -1290,6 +1356,7 @@ def train(args) -> None:
         debug_print=args.debug_print,
         reward_breakdown_debug=args.print_reward_breakdown or args.debug_print,
         reward_correctness_baseline=args.reward_correctness_baseline,
+        reward_sparse=args.reward_sparse,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1790,6 +1857,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print_reward_breakdown", action="store_true", help="Print per-turn reward component breakdowns during training")
     parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
     parser.add_argument("--reward_correctness_baseline", action="store_true", help="Use only diagnosis correctness as reward for every turn")
+    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost (more standard RL)")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)

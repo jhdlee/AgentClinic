@@ -106,6 +106,7 @@ def evaluate(args) -> None:
         debug_print=args.debug_print,
         reward_breakdown_debug=args.print_reward_breakdown,
         reward_correctness_baseline=args.reward_correctness_baseline,
+        reward_sparse=args.reward_sparse,
     )
 
     # Load model
@@ -367,6 +368,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_print", action="store_true")
     parser.add_argument("--print_reward_breakdown", action="store_true")
     parser.add_argument("--reward_correctness_baseline", action="store_true")
+    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_level", type=str, default="INFO")

@@ -120,6 +120,41 @@ python sweep_max_turns.py \
     --wandb_project my_project
 ```
 
+### Reward Modes
+
+**Sparse Reward (Standard RL)**:
+Use `--reward_sparse` for standard RL approach where only the diagnosis turn gets substantial reward:
+- Question turns: `-question_cost` (small penalty encouraging efficiency)
+- Diagnosis turn: `correctness + budget_bonus`
+
+This is more aligned with RL literature and lets PPO's value function handle credit assignment automatically.
+
+```bash
+python sweep_max_turns.py \
+    --mode train \
+    --max_turns_range 2 3 4 5 \
+    --reward_sparse \
+    --question_cost 0.1 \
+    --test_size 20
+```
+
+**Correctness-Only Baseline**:
+Use `--reward_correctness_baseline` for simplest baseline (only diagnosis correctness):
+
+```bash
+python sweep_max_turns.py \
+    --mode train \
+    --max_turns_range 2 3 4 5 \
+    --reward_correctness_baseline \
+    --test_size 20
+```
+
+**Dense Reward (Default)**:
+Without either flag, uses dense reward shaping with:
+- Question utility (temporally weighted)
+- Budget efficiency
+- Diagnosis correctness
+
 ### Continue on Error
 
 If one run fails, continue with the rest:
