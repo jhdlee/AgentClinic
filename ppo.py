@@ -528,7 +528,9 @@ class AgentClinicSimulator:
             f"You are only allowed to ask {state.max_turns} questions total before you must make a decision. You have asked {turns_taken} questions so far.",
             "You can request test results using the format \"REQUEST TEST: [test]\". For example, \"REQUEST TEST: Chest_X-Ray\".",
             "Your dialogue will only be 1-3 sentences in length.",
-            "Once you have decided to make a diagnosis please type \"DIAGNOSIS READY: [diagnosis here]\".",
+            "Once you have decided to make a diagnosis, first provide your complete reasoning process leading to the diagnosis.",
+            "Explain your reasoning clearly and concisely. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\".",
+            "In each turn, you can do only one of the following: ask a question, request a test, or make a diagnosis."
         ]
         bias_prompt = generate_doctor_bias_prompt(self.doctor_bias)
         if bias_prompt:
@@ -538,7 +540,7 @@ class AgentClinicSimulator:
             system_prompt.append(
                 f"Do not ask the following question(s) during this interaction: {formatted}."
             )
-        system_prompt.append("\n\nBelow is all of the information you have. {}. \n\n Remember, you must discover their disease by asking them questions. You are also able to provide exams.".format(state.scenario.examiner_information()))
+        system_prompt.append("\n\nBelow is all of the information you have. {}\n\nRemember, you must discover their disease by asking them questions. You are also able to provide exams.".format(state.scenario.examiner_information()))
         system_prompt_str = " ".join(system_prompt)
 
         prompt = ["\nHere is a history of your dialogue: "]
@@ -550,13 +552,12 @@ class AgentClinicSimulator:
         else:
             prompt.append("No dialogue yet.")
         if previous_reply_role and previous_reply_text:
-            prompt.append(f"\nHere was the {previous_reply_role.capitalize()} response: {previous_reply_text}.")
+            prompt.append(f"\nHere was the {previous_reply_role.capitalize()} response: {previous_reply_text}")
         else:
             prompt.append("The patient awaits your first question.")
 
         if turns_remaining == 1:
-            prompt.append("This is the final interaction. First, provide your complete reasoning process leading to the diagnosis.")
-            prompt.append("Explain your reasoning clearly and concisely. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\". Do not ask further questions or request additional tests.")
+            prompt.append("This is the final interaction. Provide your final diagnosis. Do not ask further questions or request additional tests.")
         prompt.append("Now please continue your dialogue\nDoctor: ")
 
         prompt_str = " ".join(prompt)
@@ -611,8 +612,8 @@ class AgentClinicSimulator:
                     f"\n========== EPISODE {state.scenario_id} :: TURN {turn_num} ==========",
                     flush=True,
                 )
-                print("[Prompt]\n" + prompt, flush=True)
                 print("[System Prompt]\n" + system_prompt, flush=True)
+                print("[Prompt]\n" + prompt, flush=True)
                 print(
                     f"[Doctor -> Patient/Test]\n{doctor_response}",
                     flush=True,
