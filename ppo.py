@@ -452,6 +452,7 @@ class AgentClinicSimulator:
         doctor_bias: Optional[str] = None,
         debug_print: bool = False,
         reward_breakdown_debug: bool = False,
+        reward_correctness_baseline: bool = False,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -473,6 +474,7 @@ class AgentClinicSimulator:
         self.forbidden_retry_limit = 3
         self.debug_print = debug_print
         self.reward_breakdown_debug = reward_breakdown_debug
+        self.reward_correctness_baseline = reward_correctness_baseline
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -676,6 +678,44 @@ class AgentClinicSimulator:
         ]
 
         correctness, moderator_decision = self._evaluate_correctness(state)
+
+        if self.reward_correctness_baseline:
+            diagnosis_component = self.diagnosis_reward_weight * correctness
+            per_turn_components = [
+                {"diagnosis": diagnosis_component, "budget": 0.0, "question": 0.0}
+                for _ in state.turns
+            ]
+            per_turn_rewards = [diagnosis_component for _ in state.turns]
+            reward = diagnosis_component
+
+            if self.debug_print or self.reward_breakdown_debug:
+                print(
+                    f"[Episode {state.scenario_id}] Baseline reward (diagnosis correctness only) | "
+                    f"correctness={correctness:.3f} (w={self.diagnosis_reward_weight}) | total={reward:.3f}"
+                )
+                if per_turn_components:
+                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (baseline):")
+                    for idx, (turn, components, total) in enumerate(
+                        zip(state.turns, per_turn_components, per_turn_rewards), start=1
+                    ):
+                        print(
+                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
+                            "diagnosis={diag:.3f}".format(
+                                turn_idx=idx,
+                                action=turn.action.type,
+                                total=total,
+                                diag=components["diagnosis"],
+                            )
+                        )
+
+            return reward, {
+                "correctness": correctness,
+                "budget_saved": state.remaining_budget / float(max(state.max_turns, 1)),
+                "question_reward": 0.0,
+                "moderator_decision": moderator_decision,
+                "reward_per_turn": per_turn_rewards or [reward],
+                "reward_breakdown_per_turn": per_turn_components,
+            }
 
         if total_questions > 0 and self.question_reward_weight != 0.0:
             question_counter = 0
@@ -1203,6 +1243,7 @@ def train(args) -> None:
         doctor_bias=args.doctor_bias,
         debug_print=args.debug_print,
         reward_breakdown_debug=args.print_reward_breakdown or args.debug_print,
+        reward_correctness_baseline=args.reward_correctness_baseline,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1589,6 +1630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_print", action="store_true", help="Print interactions and counterfactual details for debugging")
     parser.add_argument("--print_reward_breakdown", action="store_true", help="Print per-turn reward component breakdowns during training")
     parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
+    parser.add_argument("--reward_correctness_baseline", action="store_true", help="Use only diagnosis correctness as reward for every turn")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
