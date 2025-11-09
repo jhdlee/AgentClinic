@@ -1441,6 +1441,9 @@ def train(args) -> None:
                 for r in turn_rewards
             ]
 
+            # Update batch_size to match the number of turns in this episode
+            trainer.config.batch_size = len(turns)
+
             # Single trainer.step() call with all turns from the episode
             stats = trainer.step(query_tensors, response_tensors, reward_tensors)
 
