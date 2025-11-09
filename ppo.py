@@ -32,7 +32,7 @@ import re
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -558,7 +558,7 @@ class AgentClinicSimulator:
 
         if turns_remaining == 1:
             prompt.append("This is the final interaction. Provide your final diagnosis. Do not ask further questions or request additional tests.")
-        prompt.append("Now please continue your dialogue\nDoctor: ")
+        prompt.append("Now please continue your dialogue.\nDoctor: ")
 
         prompt_str = " ".join(prompt)
 
@@ -665,9 +665,10 @@ class AgentClinicSimulator:
         self,
         state: DoctorEpisodeState,
         generate_fn,
-    ) -> Tuple[float, Dict[str, float]]:
+    ) -> Tuple[float, Dict[str, Any]]:
         question_reward_total = 0.0
         total_questions = sum(1 for action in state.actions if action.type != "diagnosis")
+        per_turn_rewards: List[float] = [0.0 for _ in state.turns]
 
         correctness, moderator_decision = self._evaluate_correctness(state)
 
@@ -697,14 +698,29 @@ class AgentClinicSimulator:
                             exc,
                         )
                         self._utility_warning_emitted = True
-                question_reward_total += temporal_weight * utility
+                question_component = temporal_weight * utility
+                question_reward_total += question_component
+                if per_turn_rewards:
+                    per_turn_rewards[idx] += self.question_reward_weight * question_component
 
         budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
-        reward = (
-            self.diagnosis_reward_weight * correctness
-            + self.budget_reward_weight * budget_fraction
-            + self.question_reward_weight * question_reward_total
-        )
+        diagnosis_component = self.diagnosis_reward_weight * correctness
+        budget_component = self.budget_reward_weight * budget_fraction
+        question_component_weighted = self.question_reward_weight * question_reward_total
+
+        reward = diagnosis_component + budget_component + question_component_weighted
+
+        if per_turn_rewards:
+            diagnosis_turn_idx = next(
+                (
+                    idx
+                    for idx, turn in enumerate(state.turns)
+                    if turn.action.type == "diagnosis"
+                ),
+                len(state.turns) - 1,
+            )
+            per_turn_rewards[diagnosis_turn_idx] += diagnosis_component + budget_component
+
         if self.debug_print:
             print(
                 f"[Episode {state.scenario_id}] Reward components | "
@@ -718,6 +734,7 @@ class AgentClinicSimulator:
             "budget_saved": budget_fraction,
             "question_reward": question_reward_total,
             "moderator_decision": moderator_decision,
+            "reward_per_turn": per_turn_rewards,
         }
 
     def _question_confidence_gain(
@@ -1227,33 +1244,36 @@ def train(args) -> None:
                 continue
 
             reward_value = episode_info.pop("reward")
-            query_tensor = torch.cat(
-                [turn.query_tensor for turn in turns], dim=0
-            )
-            response_tensor = torch.cat(
-                [turn.response_tensor for turn in turns], dim=0
-            )
-            reward_tensor = torch.tensor(
-                reward_value, device=device, dtype=torch.float32
-            )
+            turn_rewards = episode_info.pop("reward_per_turn", None)
+            if not turn_rewards or len(turn_rewards) != len(turns):
+                turn_rewards = [reward_value for _ in turns]
+
+            query_tensors = [turn.query_tensor for turn in turns]
+            response_tensors = [turn.response_tensor for turn in turns]
+            reward_tensors = [
+                torch.tensor(
+                    [turn_reward], device=device, dtype=torch.float32
+                )
+                for turn_reward in turn_rewards
+            ]
 
             stats = trainer.step(
-                [query_tensor],
-                [response_tensor],
-                [reward_tensor],
+                query_tensors,
+                response_tensors,
+                reward_tensors,
             )
 
             trainer.log_stats(
                 stats,
                 {
-                    "prompt": [turns[-1].prompt],
-                    "response": [turns[-1].doctor_text],
-                    "reward": [reward_value],
-                    "scenario_id": [state.scenario_id],
-                    "turn_index": [len(turns) - 1],
-                    "action_type": [turns[-1].action.type],
+                    "prompt": [turn.prompt for turn in turns],
+                    "response": [turn.doctor_text for turn in turns],
+                    "reward": turn_rewards,
+                    "scenario_id": [state.scenario_id] * len(turns),
+                    "turn_index": list(range(len(turns))),
+                    "action_type": [turn.action.type for turn in turns],
                 },
-                [reward_tensor],
+                reward_tensors,
             )
 
             if trainer.accelerator.is_main_process:
