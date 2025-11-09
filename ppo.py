@@ -26,6 +26,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -450,6 +451,7 @@ class AgentClinicSimulator:
         patient_bias: Optional[str] = None,
         doctor_bias: Optional[str] = None,
         debug_print: bool = False,
+        reward_breakdown_debug: bool = False,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -470,6 +472,7 @@ class AgentClinicSimulator:
         self._utility_warning_emitted = False
         self.forbidden_retry_limit = 3
         self.debug_print = debug_print
+        self.reward_breakdown_debug = reward_breakdown_debug
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -668,7 +671,9 @@ class AgentClinicSimulator:
     ) -> Tuple[float, Dict[str, Any]]:
         question_reward_total = 0.0
         total_questions = sum(1 for action in state.actions if action.type != "diagnosis")
-        per_turn_rewards: List[float] = [0.0 for _ in state.turns]
+        per_turn_components: List[Dict[str, float]] = [
+            {"diagnosis": 0.0, "budget": 0.0, "question": 0.0} for _ in state.turns
+        ]
 
         correctness, moderator_decision = self._evaluate_correctness(state)
 
@@ -700,8 +705,10 @@ class AgentClinicSimulator:
                         self._utility_warning_emitted = True
                 question_component = temporal_weight * utility
                 question_reward_total += question_component
-                if per_turn_rewards:
-                    per_turn_rewards[idx] += self.question_reward_weight * question_component
+                if per_turn_components:
+                    per_turn_components[idx]["question"] += (
+                        self.question_reward_weight * question_component
+                    )
 
         budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
         diagnosis_component = self.diagnosis_reward_weight * correctness
@@ -710,7 +717,7 @@ class AgentClinicSimulator:
 
         reward = diagnosis_component + budget_component + question_component_weighted
 
-        if per_turn_rewards:
+        if per_turn_components:
             diagnosis_turn_idx = next(
                 (
                     idx
@@ -719,9 +726,12 @@ class AgentClinicSimulator:
                 ),
                 len(state.turns) - 1,
             )
-            per_turn_rewards[diagnosis_turn_idx] += diagnosis_component + budget_component
+            per_turn_components[diagnosis_turn_idx]["diagnosis"] += diagnosis_component
+            per_turn_components[diagnosis_turn_idx]["budget"] += budget_component
 
-        if self.debug_print:
+        per_turn_rewards = [sum(comp.values()) for comp in per_turn_components]
+
+        if self.debug_print or self.reward_breakdown_debug:
             print(
                 f"[Episode {state.scenario_id}] Reward components | "
                 f"diagnosis={correctness:.3f} (w={self.diagnosis_reward_weight}) | "
@@ -729,12 +739,29 @@ class AgentClinicSimulator:
                 f"question={question_reward_total:.3f} (w={self.question_reward_weight}) | "
                 f"total={reward:.3f}"
             )
+            if per_turn_components:
+                print(f"[Episode {state.scenario_id}] Per-turn reward breakdown:")
+                for idx, (turn, components, total) in enumerate(
+                    zip(state.turns, per_turn_components, per_turn_rewards), start=1
+                ):
+                    print(
+                        "  Turn {turn_idx} ({action}): total={total:.3f} | "
+                        "diagnosis={diag:.3f} | budget={budget:.3f} | question={question:.3f}".format(
+                            turn_idx=idx,
+                            action=turn.action.type,
+                            total=total,
+                            diag=components["diagnosis"],
+                            budget=components["budget"],
+                            question=components["question"],
+                        )
+                    )
         return reward, {
             "correctness": correctness,
             "budget_saved": budget_fraction,
             "question_reward": question_reward_total,
             "moderator_decision": moderator_decision,
             "reward_per_turn": per_turn_rewards,
+            "reward_breakdown_per_turn": per_turn_components,
         }
 
     def _question_confidence_gain(
@@ -1090,6 +1117,63 @@ def prepare_generation_kwargs(args, tokenizer: AutoTokenizer) -> Dict:
     }
 
 
+def verify_ppo_gradients(trainer: PPOTrainer, stats: Dict[str, Any], context: str) -> None:
+    """Debug helper to ensure PPO gradients remain finite."""
+
+    grad_norm_value: Optional[float] = None
+    grad_norm = stats.get("ppo/grad_norm")
+    if grad_norm is not None:
+        try:
+            grad_norm_value = float(grad_norm)
+        except (TypeError, ValueError):
+            grad_norm_value = None
+        if grad_norm_value is not None and not math.isfinite(grad_norm_value):
+            raise ValueError(
+                f"Reported PPO grad norm is non-finite after {context}: {grad_norm_value}"
+            )
+
+    missing_grad_params: List[str] = []
+    non_finite_params: List[str] = []
+    max_param_norm = 0.0
+    params_with_grad = 0
+
+    with torch.no_grad():
+        model = trainer.accelerator.unwrap_model(trainer.model)
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            grad = param.grad
+            if grad is None:
+                missing_grad_params.append(name)
+                continue
+            params_with_grad += 1
+            if not torch.isfinite(grad).all():
+                non_finite_params.append(name)
+                continue
+            param_norm = grad.detach().float().norm(2).item()
+            if param_norm > max_param_norm:
+                max_param_norm = param_norm
+
+    if non_finite_params:
+        sample = ", ".join(non_finite_params[:5])
+        raise ValueError(
+            f"Non-finite gradients detected after PPO step ({context}) in parameters: {sample}"
+        )
+
+    report_parts = [
+        f"[PPO Gradient Debug] {context}",
+        f"params_with_grad={params_with_grad}",
+    ]
+    if grad_norm_value is not None:
+        report_parts.append(f"reported_grad_norm={grad_norm_value:.6f}")
+    if max_param_norm > 0.0:
+        report_parts.append(f"max_param_grad_norm={max_param_norm:.6f}")
+    if missing_grad_params:
+        report_parts.append(f"params_missing_grad={len(missing_grad_params)}")
+
+    print(" | ".join(report_parts))
+
+
 def train(args) -> None:
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1118,6 +1202,7 @@ def train(args) -> None:
         patient_bias=args.patient_bias,
         doctor_bias=args.doctor_bias,
         debug_print=args.debug_print,
+        reward_breakdown_debug=args.print_reward_breakdown or args.debug_print,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1252,8 +1337,14 @@ def train(args) -> None:
 
             reward_value = episode_info.pop("reward")
             turn_rewards = episode_info.pop("reward_per_turn", None)
+            turn_breakdown = episode_info.pop("reward_breakdown_per_turn", None)
+            if turn_breakdown and len(turn_breakdown) == len(turns):
+                breakdown_totals = [sum(components.values()) for components in turn_breakdown]
+                if turn_rewards is None:
+                    turn_rewards = breakdown_totals
             if not turn_rewards or len(turn_rewards) != len(turns):
                 turn_rewards = [reward_value for _ in turns]
+                turn_breakdown = None
 
             for turn_idx, (turn, turn_reward) in enumerate(zip(turns, turn_rewards)):
                 reward_tensor = torch.tensor(
@@ -1278,6 +1369,16 @@ def train(args) -> None:
                     },
                     [reward_tensor],
                 )
+
+                if (
+                    args.debug_verify_gradients
+                    and trainer.accelerator.is_main_process
+                ):
+                    verify_ppo_gradients(
+                        trainer,
+                        stats,
+                        context=f"epoch={epoch + 1},scenario={state.scenario_id},turn={turn_idx + 1}",
+                    )
 
             if trainer.accelerator.is_main_process:
                 scalar_logs = {
@@ -1472,7 +1573,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mini_batch_size", type=int, default=1, help="PPO mini-batch size (forced to 1)")
     parser.add_argument("--num_ppo_epochs", type=int, default=4, help="Number of PPO optimisation epochs per batch")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of passes over the scenario list")
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1486,6 +1587,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question_reward_weight", type=float, default=1.0, help="Weight applied to the summed question utilities")
     parser.add_argument("--diagnosis_reward_weight", type=float, default=1.0, help="Weight applied to diagnosis correctness")
     parser.add_argument("--debug_print", action="store_true", help="Print interactions and counterfactual details for debugging")
+    parser.add_argument("--print_reward_breakdown", action="store_true", help="Print per-turn reward component breakdowns during training")
+    parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
