@@ -1635,6 +1635,30 @@ def train(args) -> None:
                         "final_eval/test_avg_interactions": test_avg_turns,
                     })
 
+        # Save final evaluation results in standard format for sweep compatibility
+        eval_results_summary = {}
+        if train_eval_metrics:
+            total_correct = sum(m["correctness"] for m in train_eval_metrics)
+            eval_results_summary["train"] = {
+                "accuracy": total_correct / len(train_eval_metrics),
+                "avg_interactions": sum(m["num_turns"] for m in train_eval_metrics) / len(train_eval_metrics),
+                "num_scenarios": len(train_indices),
+                "num_correct": int(total_correct),
+            }
+        if test_indices and test_eval_metrics:
+            total_correct = sum(m["correctness"] for m in test_eval_metrics)
+            eval_results_summary["test"] = {
+                "accuracy": total_correct / len(test_eval_metrics),
+                "avg_interactions": sum(m["num_turns"] for m in test_eval_metrics) / len(test_eval_metrics),
+                "num_scenarios": len(test_indices),
+                "num_correct": int(total_correct),
+            }
+        if eval_results_summary:
+            eval_path = os.path.join(output_dir, "evaluation_results.json")
+            with open(eval_path, "w", encoding="utf-8") as f:
+                json.dump(eval_results_summary, f, indent=2)
+            logger.info("Saved evaluation results to %s", eval_path)
+
         if was_training:
             policy_model.train()
 
