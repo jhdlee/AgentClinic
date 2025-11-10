@@ -34,6 +34,12 @@ try:
 except ImportError:
     BitsAndBytesConfig = None
 
+try:
+    from vllm import LLM, SamplingParams
+except ImportError:
+    LLM = None
+    SamplingParams = None
+
 # Import from ppo.py
 from ppo import (
     ScenarioLoaderMedQA,
@@ -65,6 +71,27 @@ def load_model_for_evaluation(
     )
     model.eval()
     return model
+
+
+def load_vllm_for_evaluation(
+    model_name: str,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+):
+    """Load vLLM model for faster evaluation."""
+    if LLM is None:
+        raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+    model_name = model_name.replace("HF_", "").replace("VLLM_", "")
+    logger.info("Loading vLLM model from %s", model_name)
+
+    llm = LLM(
+        model=model_name,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        trust_remote_code=True,
+    )
+    return llm
 
 
 def evaluate(args) -> None:
@@ -110,20 +137,32 @@ def evaluate(args) -> None:
     )
 
     # Load model
-    bnb_config = create_bnb_config(args)
-    torch_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)
-
     model_source = args.model_name or args.base_model_name
-    model = load_model_for_evaluation(
-        model_source,
-        bnb_config,
-        torch_dtype,
-        args.device,
-        args.trust_remote_code,
-    )
+    use_vllm = args.use_vllm_policy
+
+    if use_vllm:
+        # Load vLLM model for faster inference
+        vllm_model = load_vllm_for_evaluation(
+            model_source,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        )
+        model = None
+    else:
+        # Load standard HF model
+        bnb_config = create_bnb_config(args)
+        torch_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)
+        model = load_model_for_evaluation(
+            model_source,
+            bnb_config,
+            torch_dtype,
+            args.device,
+            args.trust_remote_code,
+        )
+        vllm_model = None
 
     tokenizer_name = args.tokenizer_name or args.base_model_name
-    tokenizer_name = tokenizer_name.replace("HF_", "")
+    tokenizer_name = tokenizer_name.replace("HF_", "").replace("VLLM_", "")
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_name,
         use_fast=not args.disable_fast_tokenizer,
@@ -133,7 +172,8 @@ def evaluate(args) -> None:
     if tokenizer.pad_token is None:
         pad_token = tokenizer.eos_token or "<|pad|>"
         tokenizer.add_special_tokens({"pad_token": pad_token})
-        model.resize_token_embeddings(len(tokenizer))
+        if model is not None:
+            model.resize_token_embeddings(len(tokenizer))
 
     tokenizer.padding_side = "left"
 
@@ -149,10 +189,19 @@ def evaluate(args) -> None:
         "eos_token_id": tokenizer.eos_token_id,
     }
 
+    # vLLM sampling params
+    if use_vllm:
+        if SamplingParams is None:
+            raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+        vllm_sampling_params = SamplingParams(
+            temperature=args.temperature,
+            max_tokens=args.max_new_tokens,
+            top_p=args.top_p,
+        )
+
     def generate_response(
         prompt: Tuple[str, str],
-        scenario_id: Optional[int] = None,
-        turn_idx: Optional[int] = None,
+        temperature_override: Optional[float] = None,
     ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
         """Generate response from model."""
         system_prompt_text, user_prompt_text = prompt
@@ -175,26 +224,50 @@ def evaluate(args) -> None:
                 else user_prompt_text
             )
 
-        inputs = tokenizer(prompt_for_model, return_tensors="pt").to(device)
-        query_tensors = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask")
-
-        with torch.no_grad():
-            output_tensors = model.generate(
-                query_tensors,
-                attention_mask=attention_mask,
-                **generation_kwargs,
+        if use_vllm:
+            # Use vLLM for generation
+            sampling_params = SamplingParams(
+                temperature=temperature_override if temperature_override is not None else args.temperature,
+                max_tokens=args.max_new_tokens,
+                top_p=args.top_p,
             )
+            outputs = vllm_model.generate([prompt_for_model], sampling_params)
+            response_text = outputs[0].outputs[0].text.strip()
 
-        generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
-        if generated_tokens.shape[-1] == 0:
-            generated_tokens = output_tensors[:, -1:]
+            # Tokenize for PPO (need input and response tensors)
+            inputs = tokenizer(prompt_for_model, return_tensors="pt")
+            query_tensor = inputs["input_ids"].squeeze(0)
+            response_tokens = tokenizer(response_text, return_tensors="pt")
+            response_tensor = response_tokens["input_ids"].squeeze(0)
 
-        query_tensor = query_tensors.squeeze(0).detach()
-        response_tensor = generated_tokens.squeeze(0).detach()
-        response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
+            return query_tensor, response_tensor, response_text
+        else:
+            # Use HuggingFace model
+            inputs = tokenizer(prompt_for_model, return_tensors="pt").to(device)
+            query_tensors = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask")
 
-        return query_tensor, response_tensor, response_text
+            gen_kwargs = generation_kwargs.copy()
+            if temperature_override is not None:
+                gen_kwargs["temperature"] = temperature_override
+                gen_kwargs["do_sample"] = temperature_override > 0
+
+            with torch.no_grad():
+                output_tensors = model.generate(
+                    query_tensors,
+                    attention_mask=attention_mask,
+                    **gen_kwargs,
+                )
+
+            generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
+            if generated_tokens.shape[-1] == 0:
+                generated_tokens = output_tensors[:, -1:]
+
+            query_tensor = query_tensors.squeeze(0).detach()
+            response_tensor = generated_tokens.squeeze(0).detach()
+            response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
+
+            return query_tensor, response_tensor, response_text
 
     results = {}
 
@@ -357,9 +430,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--eval_train", action="store_true", help="Also evaluate on training set")
 
-    parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the patient agent (prefixed with HF_ or VLLM_)")
+    parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the measurement agent (prefixed with HF_ or VLLM_)")
+    parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for moderator rewards (prefixed with HF_ or VLLM_)")
+
+    parser.add_argument("--use_vllm_policy", action="store_true", help="Use vLLM for policy model inference (faster)")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Number of GPUs to use for vLLM tensor parallelism")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM (0.0-1.0)")
 
     parser.add_argument("--use_4bit", action="store_true")
     parser.add_argument("--bf16", action="store_true")

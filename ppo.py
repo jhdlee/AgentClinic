@@ -42,6 +42,12 @@ try:  # Optional dependency for 4-bit loading
 except ImportError:  # pragma: no cover - optional dependency
     BitsAndBytesConfig = None  # type: ignore
 
+try:  # Optional dependency for vLLM
+    from vllm import LLM, SamplingParams
+except ImportError:  # pragma: no cover - optional dependency
+    LLM = None  # type: ignore
+    SamplingParams = None  # type: ignore
+
 from transformers import AutoTokenizer, set_seed, pipeline
 
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
@@ -92,48 +98,151 @@ def inference_huggingface(prompt, pipe, max_new_tokens=200, temperature=0.0):
 # Simple cache for HF pipelines so we only load once per model id
 HUGGINGFACE_PIPES = {}
 
-def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False):
+# ---------------------------------------------------------------------------
+# vLLM utility functions
+# ---------------------------------------------------------------------------
+
+def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9):
+    """
+    Load a vLLM model for faster inference.
+
+    Args:
+        model: The model name/path
+        tensor_parallel_size: Number of GPUs to use for tensor parallelism
+        gpu_memory_utilization: GPU memory utilization (0.0 to 1.0)
+
+    Returns:
+        The vLLM LLM instance
+    """
+    if LLM is None:
+        raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+    llm = LLM(
+        model=model,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        trust_remote_code=True,
+    )
+    return llm
+
+def inference_vllm(prompt, llm, max_new_tokens=200, temperature=0.0):
+    """
+    Run inference on a vLLM model.
+
+    Args:
+        prompt: The formatted input text
+        llm: The vLLM LLM instance
+        max_new_tokens: Maximum number of new tokens to generate
+        temperature: Sampling temperature (lower = more deterministic)
+
+    Returns:
+        The generated text (with prompt removed)
+    """
+    if SamplingParams is None:
+        raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+        top_p=1.0,
+    )
+
+    outputs = llm.generate([prompt], sampling_params)
+    response = outputs[0].outputs[0].text.strip()
+
+    return response
+
+# Simple cache for vLLM models so we only load once per model id
+VLLM_MODELS = {}
+
+def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False, vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9):
     for _ in range(tries):
-        if clip_prompt: 
+        if clip_prompt:
             prompt = prompt[:max_prompt_len]
         try:
             if isinstance(model, str):
-                if not model.startswith("HF_"):
-                    raise ValueError("Only HuggingFace backends prefixed with 'HF_' are currently supported.")
-                # Extract the HF repo id
-                hf_id = model[3:]
-                
-                # Load or retrieve cached pipeline
-                pipe = HUGGINGFACE_PIPES.get(hf_id)
-                if pipe is None:
-                    pipe = load_huggingface_model(hf_id)
-                    HUGGINGFACE_PIPES[hf_id] = pipe
+                # Check if vLLM backend is requested
+                if model.startswith("VLLM_"):
+                    # Extract the model id
+                    model_id = model[5:]
+
+                    # Load or retrieve cached vLLM model
+                    llm = VLLM_MODELS.get(model_id)
+                    if llm is None:
+                        llm = load_vllm_model(
+                            model_id,
+                            tensor_parallel_size=vllm_tensor_parallel_size,
+                            gpu_memory_utilization=vllm_gpu_memory_utilization
+                        )
+                        VLLM_MODELS[model_id] = llm
+
+                    # Format the prompt for vLLM
+                    # vLLM doesn't have a tokenizer attribute like HF pipelines
+                    # So we'll use a simple format or rely on the model's training format
+                    input_text = f"{system_prompt}\n\n{prompt}"
+
+                    answer = inference_vllm(input_text, llm)
+                    answer = re.sub(r"\s+", " ", answer)
+
+                    return answer
+
+                elif model.startswith("HF_"):
+                    # Extract the HF repo id
+                    hf_id = model[3:]
+
+                    # Load or retrieve cached pipeline
+                    pipe = HUGGINGFACE_PIPES.get(hf_id)
+                    if pipe is None:
+                        pipe = load_huggingface_model(hf_id)
+                        HUGGINGFACE_PIPES[hf_id] = pipe
+
+                    # Format the prompt appropriately for instruction-tuned models
+                    # Many HF models use chat templates
+                    if hasattr(pipe.tokenizer, 'apply_chat_template') and pipe.tokenizer.chat_template:
+                        messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}
+                        ]
+                        input_text = pipe.tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                    else:
+                        # Fallback for models without chat templates
+                        input_text = f"{system_prompt}\n\n{prompt}"
+
+                    answer = inference_huggingface(input_text, pipe)
+                    answer = re.sub(r"\s+", " ", answer)
+
+                    return answer
+                else:
+                    raise ValueError("Model backends must be prefixed with 'HF_' (HuggingFace) or 'VLLM_' (vLLM).")
             else:
+                # Assume it's a model object/path for HuggingFace
                 pipe = load_huggingface_model(model)
-                
-            # Format the prompt appropriately for instruction-tuned models
-            # Many HF models use chat templates
-            if hasattr(pipe.tokenizer, 'apply_chat_template') and pipe.tokenizer.chat_template:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
-                input_text = pipe.tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-                # print(f'input_text: {input_text}')
-                # print('chat template applied!')
-            else:
-                # Fallback for models without chat templates
-                input_text = f"{system_prompt}\n\n{prompt}"
-            
-            answer = inference_huggingface(input_text, pipe)
-            answer = re.sub(r"\s+", " ", answer)
-            
-            return answer
-        
+
+                # Format the prompt appropriately for instruction-tuned models
+                # Many HF models use chat templates
+                if hasattr(pipe.tokenizer, 'apply_chat_template') and pipe.tokenizer.chat_template:
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                    input_text = pipe.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                else:
+                    # Fallback for models without chat templates
+                    input_text = f"{system_prompt}\n\n{prompt}"
+
+                answer = inference_huggingface(input_text, pipe)
+                answer = re.sub(r"\s+", " ", answer)
+
+                return answer
+
         except Exception:
             time.sleep(timeout)
             continue
@@ -1254,6 +1363,22 @@ def train(args) -> None:
     device = trainer.accelerator.device
     policy_model = trainer.accelerator.unwrap_model(trainer.model).pretrained_model
 
+    # Optionally load vLLM for faster policy generation during training
+    policy_vllm = None
+    if args.use_vllm_policy:
+        if LLM is None:
+            raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+        logger.info("Loading vLLM for policy model generation (training)")
+        model_source = args.model_name or args.base_model_name
+        model_source = model_source.replace("HF_", "")
+        policy_vllm = LLM(
+            model=model_source,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            trust_remote_code=args.trust_remote_code,
+        )
+        logger.info("vLLM policy model loaded successfully")
+
     def generate_response(
         prompt: Tuple[str, str],
         temperature_override: Optional[float] = None,
@@ -1277,40 +1402,71 @@ def train(args) -> None:
                 else user_prompt_text
             )
 
-        inputs = tokenizer(prompt_for_model, return_tensors="pt").to(device)
-        query_tensors = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask")
-
         # Override temperature for forward simulation if specified
-        gen_kwargs = generation_kwargs.copy()
-        if temperature_override is not None:
-            gen_kwargs["temperature"] = temperature_override
-            gen_kwargs["do_sample"] = temperature_override > 0
+        temperature = temperature_override if temperature_override is not None else args.temperature
 
         if args.debug_print and temperature_override is None:
             # Only print once per episode to avoid spam
             if not hasattr(generate_response, '_temp_printed'):
-                print(f"[Generation] Using temperature={gen_kwargs['temperature']}, do_sample={gen_kwargs['do_sample']}", flush=True)
+                print(f"[Generation] Using temperature={temperature}, use_vllm={policy_vllm is not None}", flush=True)
                 generate_response._temp_printed = True
 
-        # Keep model in training mode during PPO rollout (following CollabLLM)
-        # This ensures policy consistency between data collection and optimization
-        with torch.no_grad():
-            output_tensors = policy_model.generate(
-                query_tensors,
-                attention_mask=attention_mask,
-                **gen_kwargs,
+        if policy_vllm is not None:
+            # Use vLLM for generation (faster)
+            if SamplingParams is None:
+                raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=args.max_new_tokens,
+                top_p=args.top_p,
             )
 
-        generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
-        if generated_tokens.shape[-1] == 0:
-            generated_tokens = output_tensors[:, -1:]
+            # Generate with vLLM and get token IDs directly
+            outputs = policy_vllm.generate([prompt_for_model], sampling_params)
+            output = outputs[0]
 
-        input_tensor = query_tensors.squeeze(0).detach()
-        response_tensor = generated_tokens.squeeze(0).detach()
-        response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
+            # Extract prompt and completion token IDs
+            prompt_token_ids = output.prompt_token_ids
+            completion_token_ids = output.outputs[0].token_ids
 
-        return input_tensor, response_tensor, response_text
+            # Convert to tensors
+            input_tensor = torch.LongTensor(prompt_token_ids)
+            response_tensor = torch.LongTensor(completion_token_ids)
+
+            # Decode response text
+            response_text = tokenizer.decode(completion_token_ids, skip_special_tokens=True).strip()
+
+            return input_tensor, response_tensor, response_text
+        else:
+            # Use HuggingFace model for generation
+            inputs = tokenizer(prompt_for_model, return_tensors="pt").to(device)
+            query_tensors = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask")
+
+            gen_kwargs = generation_kwargs.copy()
+            if temperature_override is not None:
+                gen_kwargs["temperature"] = temperature_override
+                gen_kwargs["do_sample"] = temperature_override > 0
+
+            # Keep model in training mode during PPO rollout (following CollabLLM)
+            # This ensures policy consistency between data collection and optimization
+            with torch.no_grad():
+                output_tensors = policy_model.generate(
+                    query_tensors,
+                    attention_mask=attention_mask,
+                    **gen_kwargs,
+                )
+
+            generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
+            if generated_tokens.shape[-1] == 0:
+                generated_tokens = output_tensors[:, -1:]
+
+            input_tensor = query_tensors.squeeze(0).detach()
+            response_tensor = generated_tokens.squeeze(0).detach()
+            response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
+
+            return input_tensor, response_tensor, response_text
 
     global_step = 0
     episodes_completed = 0
@@ -1619,9 +1775,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_reference_model", action="store_true", help="Skip loading a reference model (disables KL term)")
     parser.add_argument("--resume_ckpt_dir", type=str, default=None, help="Resume policy weights from a previous PPO checkpoint")
 
-    parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the patient agent (prefixed with HF_)")
-    parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the measurement agent (prefixed with HF_)")
-    parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for moderator rewards (prefixed with HF_)")
+    parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the patient agent (prefixed with HF_ or VLLM_)")
+    parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the measurement agent (prefixed with HF_ or VLLM_)")
+    parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for moderator rewards (prefixed with HF_ or VLLM_)")
+
+    parser.add_argument("--use_vllm_policy", action="store_true", help="Use vLLM for policy model generation during training (significantly faster inference)")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Number of GPUs to use for vLLM tensor parallelism")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM (0.0-1.0)")
 
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA adapters for efficient fine-tuning")
     parser.add_argument("--peft_r", type=int, default=32)

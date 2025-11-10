@@ -5,16 +5,131 @@ This guide covers how to run baseline evaluation, forward simulation reward trai
 ---
 
 ## Table of Contents
-1. [Baseline Evaluation (No Fine-tuning)](#1-baseline-evaluation-no-fine-tuning)
-2. [Training with Forward Simulation Rewards](#2-training-with-forward-simulation-rewards)
-3. [Training with Budget-Aware Rewards](#3-training-with-budget-aware-rewards)
-4. [Hyperparameter Sweeps](#4-hyperparameter-sweeps)
-5. [Plotting Sweep Results](#5-plotting-sweep-results)
-6. [Key Parameters Explained](#6-key-parameters-explained)
+1. [vLLM Acceleration (Optional)](#1-vllm-acceleration-optional)
+2. [Baseline Evaluation (No Fine-tuning)](#2-baseline-evaluation-no-fine-tuning)
+3. [Training with Forward Simulation Rewards](#3-training-with-forward-simulation-rewards)
+4. [Training with Budget-Aware Rewards](#4-training-with-budget-aware-rewards)
+5. [Hyperparameter Sweeps](#5-hyperparameter-sweeps)
+6. [Plotting Sweep Results](#6-plotting-sweep-results)
+7. [Key Parameters Explained](#7-key-parameters-explained)
 
 ---
 
-## 1. Baseline Evaluation (No Fine-tuning)
+## 1. vLLM Acceleration (Optional)
+
+vLLM provides **significantly faster inference** compared to standard HuggingFace models. It's especially beneficial for the patient, measurement, and moderator agents which perform many inference calls during training and evaluation.
+
+### Installation
+
+```bash
+pip install vllm
+```
+
+### Usage
+
+There are two ways to use vLLM:
+
+#### A. For Agent Models (Patient, Measurement, Moderator)
+
+Simply prefix the model name with `VLLM_` instead of `HF_`:
+
+```bash
+# Standard HuggingFace (slower)
+--patient_llm HF_Qwen/Qwen2.5-7B-Instruct
+
+# With vLLM acceleration (faster)
+--patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct
+```
+
+**Example with vLLM agents:**
+```bash
+python3 evaluate.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --test_size 20
+```
+
+#### B. For Policy Model (Training and Evaluation)
+
+Use the `--use_vllm_policy` flag:
+
+**During Evaluation:**
+```bash
+python3 evaluate.py \
+  --base_model_name Qwen/Qwen2.5-7B-Instruct \
+  --use_vllm_policy \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --test_size 20
+```
+
+**During Training:**
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --use_vllm_policy \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --reward_forward_sim \
+  --num_train_epochs 3
+```
+
+**Note:** When using `--use_vllm_policy` during training, vLLM is used only for generation (forward passes). The HuggingFace model is still loaded for computing gradients and performing PPO updates.
+
+### vLLM Configuration Parameters
+
+- `--vllm_tensor_parallel_size`: Number of GPUs for tensor parallelism (default: 1)
+- `--vllm_gpu_memory_utilization`: GPU memory utilization 0.0-1.0 (default: 0.9)
+
+**Example with multi-GPU:**
+```bash
+python3 evaluate.py \
+  --base_model_name Qwen/Qwen2.5-7B-Instruct \
+  --use_vllm_policy \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --vllm_tensor_parallel_size 2 \
+  --vllm_gpu_memory_utilization 0.85
+```
+
+### Mixed Usage
+
+You can mix HuggingFace and vLLM models:
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm HF_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_meta-llama/Llama-3-8B-Instruct \
+  --reward_forward_sim \
+  --num_train_epochs 3
+```
+
+### When to Use vLLM
+
+✅ **Recommended for:**
+- Patient, measurement, and moderator agents (always)
+- Policy model during evaluation
+- Policy model during training (for faster generation)
+- Large-scale experiments with many scenarios
+
+💡 **How it works in training:**
+- vLLM handles generation (forward passes) for 2-5x speedup
+- HuggingFace model still computes gradients and performs PPO updates
+- Both models loaded in parallel (requires sufficient GPU memory)
+
+### Performance Benefits
+
+Using vLLM for agent models typically provides:
+- **2-5x faster inference** compared to HuggingFace
+- Better GPU utilization with tensor parallelism
+- Automatic batching and optimization
+
+---
+
+## 2. Baseline Evaluation (No Fine-tuning)
 
 The baseline evaluation runs the model on AgentClinic scenarios **without any PPO training**. This provides a reference point for comparison.
 
@@ -29,6 +144,18 @@ python3 evaluate.py \
   --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
   --dataset_path agentclinic_medqa.jsonl \
   --output_dir outputs/baseline_eval
+```
+
+### With vLLM Acceleration (Faster)
+
+```bash
+python3 evaluate.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/baseline_eval_vllm
 ```
 
 ### With Train/Test Split
@@ -73,7 +200,7 @@ Results are saved to `{output_dir}/evaluation_results.json`:
 
 ---
 
-## 2. Training with Forward Simulation Rewards
+## 3. Training with Forward Simulation Rewards
 
 The `reward_forward_sim` method trains the model using per-turn credit assignment via forward simulation.
 
@@ -89,6 +216,45 @@ python3 ppo.py \
   --max_turns 5 \
   --learning_rate 1e-6
 ```
+
+### With vLLM for Agent Models (Faster Training)
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/ppo_forward_sim_vllm \
+  --reward_forward_sim \
+  --num_train_epochs 3 \
+  --max_turns 5 \
+  --learning_rate 1e-6
+```
+
+### With vLLM for Everything (Maximum Speed)
+
+Use vLLM for both agent models AND policy model:
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --use_vllm_policy \
+  --patient_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm VLLM_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/ppo_forward_sim_vllm_full \
+  --reward_forward_sim \
+  --num_train_epochs 3 \
+  --max_turns 5 \
+  --learning_rate 1e-6 \
+  --vllm_tensor_parallel_size 1 \
+  --vllm_gpu_memory_utilization 0.85
+```
+
+**Note:** When using `--use_vllm_policy`, both HuggingFace and vLLM models are loaded. Adjust `--vllm_gpu_memory_utilization` (e.g., 0.85 or lower) if you encounter OOM errors.
 
 ### Full Training Example with All Options
 
@@ -139,7 +305,7 @@ After training completes, you'll find:
 
 ---
 
-## 3. Training with Budget-Aware Rewards
+## 4. Training with Budget-Aware Rewards
 
 The `reward_budget_aware` method trains the model to optimize turn efficiency while maintaining diagnostic accuracy. This reward mode encourages the model to use a target number of turns by:
 - Computing confidence-based question utility (how much each question improves diagnostic confidence)
@@ -237,7 +403,7 @@ After training completes, you'll find:
 
 ---
 
-## 4. Hyperparameter Sweeps
+## 5. Hyperparameter Sweeps
 
 ### Sweep Script Overview
 
@@ -362,7 +528,7 @@ outputs/sweep_fwd_sim/
 
 ---
 
-## 4. Plotting Sweep Results
+## 6. Plotting Sweep Results
 
 After running a sweep, use [plot_sweep.py](plot_sweep.py) to visualize the results.
 
@@ -476,14 +642,20 @@ python3 plot_sweep.py \
 
 ---
 
-## 5. Key Parameters Explained
+## 7. Key Parameters Explained
 
 ### Model Parameters
 
 - `--base_model_name`: HuggingFace model to use (prefix with `HF_`)
-- `--patient_llm`: Model for patient agent (default: same as base)
-- `--measurement_llm`: Model for measurement/test agent
-- `--moderator_llm`: Model for diagnosis evaluation
+- `--patient_llm`: Model for patient agent (prefix with `HF_` or `VLLM_`, default: same as base)
+- `--measurement_llm`: Model for measurement/test agent (prefix with `HF_` or `VLLM_`)
+- `--moderator_llm`: Model for diagnosis evaluation (prefix with `HF_` or `VLLM_`)
+
+### vLLM Parameters
+
+- `--use_vllm_policy`: Use vLLM for policy model generation during training and evaluation
+- `--vllm_tensor_parallel_size`: Number of GPUs for vLLM tensor parallelism (default: 1)
+- `--vllm_gpu_memory_utilization`: GPU memory utilization for vLLM 0.0-1.0 (default: 0.9, reduce to 0.7-0.85 if using `--use_vllm_policy` during training)
 
 ### Dataset Parameters
 
@@ -782,6 +954,15 @@ python3 plot_sweep.py \
    - Consider `--disable_reference_model` if memory is tight
    - Budget-aware rewards may be more memory-efficient than forward simulation as they compute confidence directly rather than running full counterfactual simulations
 
-5. **Reproducibility**: Always set `--seed 42` for reproducible results
+5. **vLLM acceleration**:
+   - Use `VLLM_` prefix for patient, measurement, and moderator agents for 2-5x faster inference
+   - Use `--use_vllm_policy` for policy model during both training and evaluation
+   - During training: vLLM handles generation; HuggingFace model handles gradients/PPO updates
+   - vLLM requires separate installation: `pip install vllm`
+   - Gracefully falls back to HuggingFace if vLLM is not installed
+   - Supports multi-GPU tensor parallelism via `--vllm_tensor_parallel_size`
+   - When using `--use_vllm_policy` during training, reduce `--vllm_gpu_memory_utilization` to 0.7-0.85 to avoid OOM
 
-6. **Sweep organization**: Each sweep run creates a descriptive directory name based on hyperparameters (e.g., `train_mt5_lr1e-05_ep3_fwd_sim_lora` or `train_mt5_lr1e-05_ep3_budget_aware`)
+6. **Reproducibility**: Always set `--seed 42` for reproducible results
+
+7. **Sweep organization**: Each sweep run creates a descriptive directory name based on hyperparameters (e.g., `train_mt5_lr1e-05_ep3_fwd_sim_lora` or `train_mt5_lr1e-05_ep3_budget_aware`)
