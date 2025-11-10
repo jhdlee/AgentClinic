@@ -845,7 +845,7 @@ class AgentClinicSimulator:
                     correct_diagnosis=gold_text,
                     moderator_llm=self.moderator_backend,
                 )
-                correctness = 1.0 if moderator_decision.strip().startswith("yes") else 0.0
+                correctness = 1.0 if moderator_decision.strip().startswith("yes") else -0.5
         return correctness, moderator_decision
 
     def _get_diagnosis_confidence(
@@ -1222,8 +1222,8 @@ def train(args) -> None:
 
     for epoch in tqdm(range(args.num_train_epochs), desc="Epochs", position=0, disable=not trainer.accelerator.is_main_process):
         scenario_indices = train_indices.copy()
-        # random.shuffle(scenario_indices)
-        logger.info("Starting epoch %s with %s training scenarios", epoch + 1, len(scenario_indices))
+        random.shuffle(scenario_indices)
+        logger.info("Starting epoch %s with %s training scenarios (scenarios_per_update=%s)", epoch + 1, len(scenario_indices), args.scenarios_per_update)
 
         epoch_rewards: List[float] = []
         epoch_correctness: List[float] = []
@@ -1237,6 +1237,13 @@ def train(args) -> None:
             disable=not trainer.accelerator.is_main_process
         )
 
+        # Batch accumulators for multiple scenarios
+        batch_input_tensors: List[torch.LongTensor] = []
+        batch_response_tensors: List[torch.LongTensor] = []
+        batch_reward_tensors: List[torch.Tensor] = []
+        batch_episode_infos: List[Dict[str, Any]] = []
+        batch_scenario_ids: List[int] = []
+
         for scenario_idx in scenario_pbar:
             input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
 
@@ -1244,56 +1251,71 @@ def train(args) -> None:
             reward_value = sum(multi_turn_rewards)
             reward_tensors = [torch.tensor(r, device=device, dtype=torch.float32) for r in multi_turn_rewards]
 
-            # Update batch_size to match the number of turns in this episode
-            trainer.config.batch_size = len(input_tensors)
+            # Accumulate data from this scenario
+            batch_input_tensors.extend(input_tensors)
+            batch_response_tensors.extend(response_tensors)
+            batch_reward_tensors.extend(reward_tensors)
+            batch_episode_infos.append({**episode_info, "reward": reward_value, "scenario_id": scenario_idx})
+            batch_scenario_ids.append(scenario_idx)
 
-            # Single trainer.step() call with all turns from the episode
-            stats = trainer.step(input_tensors, response_tensors, reward_tensors)
-
-            # Prepare batch data for logging
-            batch_data = {
-                "scenario_id": scenario_idx,
-                "input_tensors": input_tensors,
-                "response_tensors": response_tensors,
-                "reward_tensors": reward_tensors,
-            }
-
-            # Log stats once for the entire episode
-            trainer.log_stats(stats, batch_data, reward_tensors)
-
-            # Gradient verification once per episode
-            if args.debug_verify_gradients and trainer.accelerator.is_main_process:
-                verify_ppo_gradients(
-                    trainer,
-                    stats,
-                    context=f"epoch={epoch + 1},scenario={scenario_idx},num_turns={len(input_tensors)}",
-                )
-
-            if trainer.accelerator.is_main_process:
-                scalar_logs = {
-                    f"episode/{key}": value
-                    for key, value in episode_info.items()
-                    if isinstance(value, (int, float))
-                }
-                scalar_logs["episode/reward"] = reward_value
-                scalar_logs["episode/num_turns"] = len(input_tensors)
-                trainer.accelerator.log(scalar_logs)
-
-            global_step += len(input_tensors)
-            episodes_completed += 1
-
-            # Track overall metrics
+            # Track individual episode metrics
             episode_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
                     "num_turns": len(input_tensors),
                 }
             )
-
-            # Track epoch-level metrics
             epoch_rewards.append(reward_value)
             epoch_correctness.append(episode_info.get("correctness", 0.0))
             epoch_turns.append(len(input_tensors))
+
+            episodes_completed += 1
+
+            # Check if we've accumulated enough scenarios for a batch update
+            if len(batch_scenario_ids) >= args.scenarios_per_update or scenario_idx == scenario_indices[-1]:
+                # Update batch_size to match the total number of turns across all accumulated scenarios
+                trainer.config.batch_size = len(batch_input_tensors)
+
+                # Single trainer.step() call with all turns from all accumulated scenarios
+                stats = trainer.step(batch_input_tensors, batch_response_tensors, batch_reward_tensors)
+
+                # Prepare batch data for logging (use first scenario as representative)
+                batch_data = {
+                    "scenario_id": batch_scenario_ids[0],
+                    "input_tensors": batch_input_tensors,
+                    "response_tensors": batch_response_tensors,
+                    "reward_tensors": batch_reward_tensors,
+                }
+
+                # Log stats once for the entire batch
+                trainer.log_stats(stats, batch_data, batch_reward_tensors)
+
+                # Gradient verification once per batch
+                if args.debug_verify_gradients and trainer.accelerator.is_main_process:
+                    verify_ppo_gradients(
+                        trainer,
+                        stats,
+                        context=f"epoch={epoch + 1},scenarios={batch_scenario_ids},num_turns={len(batch_input_tensors)}",
+                    )
+
+                # Log per-episode info for each scenario in the batch
+                if trainer.accelerator.is_main_process:
+                    for ep_info in batch_episode_infos:
+                        scalar_logs = {
+                            f"episode/{key}": value
+                            for key, value in ep_info.items()
+                            if isinstance(value, (int, float))
+                        }
+                        trainer.accelerator.log(scalar_logs)
+
+                global_step += len(batch_input_tensors)
+
+                # Clear batch accumulators
+                batch_input_tensors = []
+                batch_response_tensors = []
+                batch_reward_tensors = []
+                batch_episode_infos = []
+                batch_scenario_ids = []
 
             # Update progress bar with running metrics
             if trainer.accelerator.is_main_process:
@@ -1308,13 +1330,12 @@ def train(args) -> None:
 
             if args.logging_steps and global_step % args.logging_steps == 0:
                 logger.info(
-                    "step=%s epoch=%s scenario=%s turns=%s reward=%.3f correctness=%.3f",
+                    "step=%s epoch=%s episodes_completed=%s avg_reward=%.3f avg_correctness=%.3f",
                     global_step,
                     epoch + 1,
-                    scenario_idx,
-                    len(input_tensors),
-                    reward_value,
-                    episode_info.get("correctness", 0.0),
+                    episodes_completed,
+                    sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0,
+                    sum(epoch_correctness) / len(epoch_correctness) if epoch_correctness else 0.0,
                 )
 
             if args.max_train_steps and global_step >= args.max_train_steps:
@@ -1514,7 +1535,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_fast_tokenizer", action="store_true", help="Force use of slow tokenizer implementation")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing on the policy model")
 
-    parser.add_argument("--batch_size", type=int, default=1, help="Number of episodes per PPO update (currently forced to 1; all turns within episode are batched together)")
+    parser.add_argument("--scenarios_per_update", type=int, default=1, help="Number of scenarios to accumulate before each PPO update")
+    parser.add_argument("--batch_size", type=int, default=1, help="Number of episodes per PPO update (automatically set based on scenarios_per_update)")
     parser.add_argument("--mini_batch_size", type=int, default=1, help="PPO mini-batch size (currently forced to 1)")
     parser.add_argument("--num_ppo_epochs", type=int, default=4, help="Number of PPO optimisation epochs per batch")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of passes over the scenario list")
@@ -1574,9 +1596,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args) -> None:
     if args.bf16 and args.fp16:
         raise ValueError("Only one of --bf16 or --fp16 can be specified.")
-    if args.batch_size != 1:
-        logger.warning("Overriding batch_size=%s → 1 (one episode per update; turns within episode are batched)", args.batch_size)
-        args.batch_size = 1
+    if args.scenarios_per_update <= 0:
+        raise ValueError("--scenarios_per_update must be positive")
     if args.mini_batch_size != 1:
         logger.warning(
             "Overriding mini_batch_size=%s → 1 (turns within episode are batched together)",
