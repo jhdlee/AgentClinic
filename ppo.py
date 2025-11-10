@@ -26,11 +26,9 @@ import argparse
 import copy
 import json
 import logging
-import math
 import os
 import random
 import re
-import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -50,13 +48,8 @@ from peft import LoraConfig, get_peft_model
 
 logger = logging.getLogger(__name__)
 
-
-def _stringify_context(value) -> str:
-    if isinstance(value, dict):
-        return "; ".join(f"{k}: {_stringify_context(v)}" for k, v in value.items())
-    if isinstance(value, list):
-        return "; ".join(_stringify_context(v) for v in value)
-    return str(value)
+# Import utility functions
+from utils import _stringify_context, CheckpointManager, save_checkpoint, verify_ppo_gradients
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +231,7 @@ class ScenarioLoaderMedQA:
 # Agents
 # ---------------------------------------------------------------------------
 class PatientAgent:
-    def __init__(self, scenario, backend_str="gpt4", bias_present=None) -> None:
+    def __init__(self, scenario, backend_str="gpt4") -> None:
         # disease of patient, or "correct answer"
         self.disease = ""
         # symptoms that patient presents
@@ -247,48 +240,10 @@ class PatientAgent:
         self.agent_hist = ""
         # language model backend for patient agent
         self.backend = backend_str
-        # presentation of any form of bias
-        self.bias_present = (None if bias_present == "None" else bias_present)
         # sample initial question from dataset
         self.scenario = scenario
         self.reset()
         self.pipe = None
-
-        self.biases = ["recency", "frequency", "false_consensus", "self_diagnosis", "gender", "race", "sexual_orientation", "cultural", "education", "religion", "socioeconomic"]
-
-    def generate_bias(self) -> str:
-        """ 
-        ================
-        Cognitive biases 
-        ================
-        """
-        if self.bias_present == "recency":
-            return "\nRecently, you had a friend with similar symptoms to yours that was diagnosed with cancer. This affects how you interact with the doctor.\n"
-        elif self.bias_present == "frequency":
-            return "\nYou recently learned that most frequently, doctors diagnose this as cancer based on past cases. This affects how you interact with the doctor.\n"
-        elif self.bias_present == "false_consensus":
-            return "\nMost of your friends who heard about your symptoms believe that you have cancer. This affects how you interact with the doctor.\n"
-        elif self.bias_present == "self_diagnosis":
-            return "\nYou recently performed a thorough investigation of your symptoms online and have come to the conclusion that you should be diagnosed with cancer. While the doctor may believe otherwise you remain convinced you have cancer. This affects how you interact with the doctor.\n"
-        elif self.bias_present == "gender":
-            return "\nYou are uncomfortable with your doctor because you find out that they are a particular gender and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "race":
-            return "\nYou are uncomfortable with your doctor because you find out that they are a particular race and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "sexual_orientation":
-            return "\nYou are uncomfortable with your doctor because you find out that they are a particular sexual orientation and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "cultural":
-            return "\nYou are uncomfortable with your doctor because you find out that they are from a particular culture and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "education":
-            return "\nYou are uncomfortable with your doctor because you find out that they went to a low ranked medical school and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "religion":
-            return "\nYou are uncomfortable with your doctor because you find out that they believe in a particular religion and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present == "socioeconomic":
-            return "\nYou are uncomfortable with your doctor because you find out that they are from a particular socioeconomic background and you do not trust their judgement. This affects how you interact with them.\n"
-        elif self.bias_present is None:
-            pass
-        else:
-            print("BIAS TYPE {} NOT SUPPORTED, ignoring bias...".format(self.bias_present))
-        return ""
 
     def inference_patient(self, question) -> str:
         answer = query_model(self.backend, "\nHere is a history of your dialogue: " + self.agent_hist + "\n Here was the doctor response: " + question + "Now please continue your dialogue\nPatient: ", self.system_prompt())
@@ -296,12 +251,9 @@ class PatientAgent:
         return answer
 
     def system_prompt(self) -> str:
-        bias_prompt = ""
-        if self.bias_present is not None:
-            bias_prompt = self.generate_bias()
         base = """You are a patient in a clinic who only responds in the form of dialogue. You are being inspected by a doctor who will ask you questions and will perform exams on you in order to understand your disease. Your answer will only be 1-3 sentences in length."""
         symptoms = "\n\nBelow is all of your information. {}. \n\n Remember, you must not reveal your disease explicitly but may only convey the symptoms you have in the form of dialogue if you are asked.".format(self.symptoms)
-        return base + bias_prompt + symptoms
+        return base + symptoms
     
     def reset(self) -> None:
         self.agent_hist = ""
@@ -347,46 +299,9 @@ def compare_results(diagnosis, correct_diagnosis, moderator_llm):
     return answer.lower()
 
 
-def generate_doctor_bias_prompt(bias_type: Optional[str]) -> str:
-    if not bias_type:
-        return ""
-
-    prompts = {
-        "recency": "Recently, you learned that a doctor with similar symptoms diagnosed their patient with cancer. This affects how you interact with the patient.",
-        "frequency": "You recently learned that most frequently, doctors diagnose patients with similar symptoms with cancer based on past cases. This affects how you interact with the patient.",
-        "false_consensus": "Most of your colleagues who heard about the patient's symptoms believe that they have cancer. This affects how you interact with the patient.",
-        "status_quo": "Your hospital has been diagnosing these patient's symptoms with cancer for the past 10 years. This affects how you interact with the patient.",
-        "confirmation": "You are initially confident that the patient has cancer. This affects how you interact with the patient.",
-        "gender": "You are uncomfortable with your patient because you find out that they are a particular gender and you do not trust their judgement. This affects how you interact with them.",
-        "race": "You are uncomfortable with your patient because you find out that they are a particular race and you do not trust their judgement. This affects how you interact with them.",
-        "sexual_orientation": "You are uncomfortable with your patient because you find out that they are a particular sexual orientation and you do not trust their judgement. This affects how you interact with them.",
-        "cultural": "You are uncomfortable with your patient because you find out that they are from a particular culture and you do not trust their judgement. This affects how you interact with them.",
-        "education": "You are uncomfortable with your patient because you find out that they are uneducated and you do not trust their judgement. This affects how you interact with them.",
-        "religion": "You are uncomfortable with your patient because you find out that they believe in a particular religion and you do not trust their judgement. This affects how you interact with them.",
-        "socioeconomic": "You are uncomfortable with your patient because you find out that they are from a particular socioeconomic background and you do not trust their judgement. This affects how you interact with them.",
-    }
-
-    return prompts.get(bias_type, "")
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
-
-@dataclass
-class EpisodeTurn:
-    prompt: str
-    doctor_text: str
-    query_tensor: torch.LongTensor
-    response_tensor: torch.LongTensor
-    action: DoctorAction
-    reply_role: Optional[str]
-    reply_text: str
-    history_before: List[Dict[str, str]]
-    patient_hist_before: str
-    measurement_hist_before: str
-    remaining_budget_before: float
-
-
 @dataclass
 class DoctorEpisodeState:
     """Mutable state for a single doctor–patient episode."""
@@ -397,16 +312,17 @@ class DoctorEpisodeState:
     max_turns: int
     history: List[Dict[str, str]] = field(default_factory=list)
     actions: List[DoctorAction] = field(default_factory=list)
-    turns: List[EpisodeTurn] = field(default_factory=list)
     done: bool = False
     patient_agent: Optional[PatientAgent] = None
     measurement_agent: Optional[MeasurementAgent] = None
     moderator_llm: Optional[str] = None
     diagnosis_action: Optional[DoctorAction] = None
+    input_tensors: List[torch.LongTensor] = field(default_factory=list)
+    response_tensors: List[torch.LongTensor] = field(default_factory=list)
+    total_num_tokens: int = 0
 
     def add_turn(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": content})
-
 
 @dataclass
 class DoctorAction:
@@ -479,12 +395,8 @@ class AgentClinicSimulator:
         question_reward_weight: float,
         diagnosis_reward_weight: float,
         seed: int = 0,
-        patient_bias: Optional[str] = None,
-        doctor_bias: Optional[str] = None,
         debug_print: bool = False,
         reward_breakdown_debug: bool = False,
-        reward_correctness_baseline: bool = False,
-        reward_sparse: bool = False,
         reward_forward_sim: bool = False,
         intrinsic_token_weight: float = 0.0,
         intrinsic_turn_weight: float = 0.0,
@@ -503,15 +415,11 @@ class AgentClinicSimulator:
         self.budget_reward_weight = float(budget_reward_weight)
         self.question_reward_weight = float(question_reward_weight)
         self.diagnosis_reward_weight = float(diagnosis_reward_weight)
-        self.patient_bias = None if patient_bias in (None, "None") else patient_bias
-        self.doctor_bias = None if doctor_bias in (None, "None") else doctor_bias
         self.random = random.Random(seed)
         self._utility_warning_emitted = False
         self.forbidden_retry_limit = 3
         self.debug_print = debug_print
         self.reward_breakdown_debug = reward_breakdown_debug
-        self.reward_correctness_baseline = reward_correctness_baseline
-        self.reward_sparse = reward_sparse
         self.reward_forward_sim = reward_forward_sim
         self.intrinsic_token_weight = float(intrinsic_token_weight)
         self.intrinsic_turn_weight = float(intrinsic_turn_weight)
@@ -529,7 +437,6 @@ class AgentClinicSimulator:
         patient_agent = PatientAgent(
             scenario=scenario,
             backend_str=self.patient_backend,
-            bias_present=self.patient_bias,
         )
         measurement_agent = MeasurementAgent(
             scenario=scenario,
@@ -559,11 +466,9 @@ class AgentClinicSimulator:
         scenario = self.scenario_loader.get_scenario(id=scenario_id)
         return self.reset(scenario)
 
-    def build_prompt(
+    def build_prompt_for_doctor(
         self,
         state: DoctorEpisodeState,
-        previous_reply_role: Optional[str],
-        previous_reply_text: Optional[str],
         forbidden_questions: Optional[Sequence[str]] = None,
     ) -> str:
         turns_taken = len(state.actions)
@@ -578,9 +483,6 @@ class AgentClinicSimulator:
             "Explain your reasoning clearly and concisely. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\".",
             "In each turn, you can do only one of the following: ask a question, request a test, or make a diagnosis."
         ]
-        bias_prompt = generate_doctor_bias_prompt(self.doctor_bias)
-        if bias_prompt:
-            system_prompt.append(bias_prompt)
         if forbidden_questions:
             formatted = ", ".join(f'"{q}"' for q in forbidden_questions)
             system_prompt.append(
@@ -594,17 +496,13 @@ class AgentClinicSimulator:
             history_str = [
                 f"{turn['role'].capitalize()}: {turn['content']}" for turn in state.history
             ]
-            prompt.append("; ".join(history_str[:-1]) + ".")
+            prompt.append("; ".join(history_str) + ".")
         else:
             prompt.append("No dialogue yet.")
-        if previous_reply_role and previous_reply_text:
-            prompt.append(f"\nHere was the {previous_reply_role.capitalize()} response: {previous_reply_text}")
-        else:
-            prompt.append("The patient awaits your first question.")
 
         if turns_remaining == 1:
             prompt.append("This is the final interaction. Do not ask further questions or request additional tests. Provide your complete reasoning process leading to the diagnosis. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\".")
-        prompt.append("Now please continue your dialogue.\nDoctor: ")
+        prompt.append("Now, please continue your dialogue.\nDoctor: ")
 
         prompt_str = " ".join(prompt)
 
@@ -617,40 +515,21 @@ class AgentClinicSimulator:
     ) -> Tuple[DoctorEpisodeState, Dict[str, float]]:
         state = self.reset_by_id(scenario_id)
 
-        previous_reply_role = None
-        previous_reply_text = None
+        states = []
         while not state.done:
-            prompt, system_prompt = self.build_prompt(state, previous_reply_role, previous_reply_text)
-            history_before = copy.deepcopy(state.history)
-            patient_hist_before = state.patient_agent.agent_hist
-            measurement_hist_before = state.measurement_agent.agent_hist
-            remaining_budget_before = state.remaining_budget
-
+            prompt, system_prompt = self.build_prompt_for_doctor(state)
             model_input = self._format_model_input(system_prompt, prompt)
-            query_tensor, response_tensor, doctor_response = generate_fn(
-                model_input,
-                scenario_id=state.scenario_id,
-                turn_idx=len(state.turns),
-            )
+            input_tensor, response_tensor, doctor_response = generate_fn(model_input)
             action = parse_action(doctor_response)
+            state.actions.append(action)
+            state.add_turn("doctor", action.text)
+            state.input_tensors.append(input_tensor)
+            state.response_tensors.append(response_tensor)
+            state.total_num_tokens += len(response_tensor)
+
+            states.append(copy.deepcopy(state))
+
             reply_role, reply_text = self._apply_action(state, action)
-            previous_reply_role = reply_role
-            previous_reply_text = reply_text
-            state.turns.append(
-                EpisodeTurn(
-                    prompt=prompt,
-                    doctor_text=doctor_response,
-                    query_tensor=query_tensor,
-                    response_tensor=response_tensor,
-                    action=action,
-                    reply_role=reply_role,
-                    reply_text=reply_text,
-                    history_before=history_before,
-                    patient_hist_before=patient_hist_before,
-                    measurement_hist_before=measurement_hist_before,
-                    remaining_budget_before=remaining_budget_before,
-                )
-            )
 
             if self.debug_print:
                 turn_num = len(state.turns)
@@ -671,21 +550,14 @@ class AgentClinicSimulator:
                     )
                 print("=" * 60, flush=True)
 
-        reward, components = self._compute_episode_reward(state, generate_fn)
-        components.setdefault("num_turns", len(state.actions))
-        components.setdefault(
-            "budget_saved", state.remaining_budget / float(max(state.max_turns, 1))
-        )
-        return state, {"reward": reward, **components}
+        rewards, components = self._compute_episode_reward(states, generate_fn)
+        return state.input_tensors, state.response_tensors, {"reward": rewards, **components}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _apply_action(self, state: DoctorEpisodeState, action: DoctorAction) -> Tuple[Optional[str], str]:
-        state.actions.append(action)
-        state.add_turn("doctor", action.text)
-
         if action.type == "diagnosis":
             state.diagnosis_action = action
             state.done = True
@@ -709,34 +581,28 @@ class AgentClinicSimulator:
 
     def _compute_episode_reward(
         self,
-        state: DoctorEpisodeState,
+        states: List[DoctorEpisodeState],
         generate_fn,
     ) -> Tuple[float, Dict[str, Any]]:
-        question_reward_total = 0.0
-        total_questions = sum(1 for action in state.actions if action.type != "diagnosis")
-        per_turn_components: List[Dict[str, float]] = [
-            {"diagnosis": 0.0, "budget": 0.0, "question": 0.0} for _ in state.turns
-        ]
 
-        correctness, moderator_decision = self._evaluate_correctness(state)
+        correctness = self._evaluate_correctness(states[-1])[0]
 
         # Forward simulation reward: per-turn extrinsic + intrinsic rewards
         if self.reward_forward_sim:
             per_turn_rewards = []
             forward_sim_correctness = []
 
-            for turn_idx, turn in enumerate(state.turns):
+            for _, state in enumerate(states):
                 # Extrinsic reward: forward simulate from this turn
-                extrinsic_correctness = self._forward_simulate_from_turn(
-                    state, turn_idx, generate_fn
+                extrinsic_correctness, total_num_tokens = self._forward_simulate_from_turn(
+                    state, generate_fn
                 )
                 forward_sim_correctness.append(extrinsic_correctness)
 
                 # Intrinsic reward: token count + turn penalty
-                token_count = len(turn.response_tensor)
                 intrinsic_reward = (
-                    -token_count * self.intrinsic_token_weight
-                    - self.intrinsic_turn_weight
+                    -total_num_tokens * self.intrinsic_token_weight
+                    # - self.intrinsic_turn_weight
                 )
 
                 # Combined reward for this turn
@@ -746,15 +612,6 @@ class AgentClinicSimulator:
                 )
                 per_turn_rewards.append(turn_reward)
 
-                # Store breakdown
-                per_turn_components[turn_idx] = {
-                    "diagnosis": self.diagnosis_reward_weight * extrinsic_correctness,
-                    "budget": 0.0,  # Not used in forward sim mode
-                    "question": intrinsic_reward,
-                }
-
-            reward = sum(per_turn_rewards)
-
             if self.debug_print or self.reward_breakdown_debug:
                 print(
                     f"[Episode {state.scenario_id}] Forward sim reward | "
@@ -762,397 +619,38 @@ class AgentClinicSimulator:
                     f"avg_forward_sim_correctness={sum(forward_sim_correctness)/len(forward_sim_correctness):.3f} | "
                     f"intrinsic_token_weight={self.intrinsic_token_weight:.4f} | "
                     f"intrinsic_turn_weight={self.intrinsic_turn_weight:.4f} | "
-                    f"total={reward:.3f}"
+                    f"total={sum(per_turn_rewards):.3f} | "
+                    f"reward_per_turn={per_turn_rewards}"
                 )
-                if per_turn_components:
-                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (forward sim):")
-                    for idx, (turn, components, total, fwd_corr) in enumerate(
-                        zip(state.turns, per_turn_components, per_turn_rewards, forward_sim_correctness), start=1
-                    ):
-                        print(
-                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
-                            "forward_sim_correctness={fwd_corr:.3f} | "
-                            "extrinsic={extrin:.3f} | intrinsic={intrin:.3f} | tokens={tokens}".format(
-                                turn_idx=idx,
-                                action=turn.action.type,
-                                total=total,
-                                fwd_corr=fwd_corr,
-                                extrin=components["diagnosis"],
-                                intrin=components["question"],
-                                tokens=len(turn.response_tensor),
-                            )
-                        )
 
-            return reward, {
+            return per_turn_rewards, {
                 "correctness": correctness,
                 "budget_saved": state.remaining_budget / float(max(state.max_turns, 1)),
-                "question_reward": sum(c["question"] for c in per_turn_components),
-                "moderator_decision": moderator_decision,
                 "reward_per_turn": per_turn_rewards,
-                "reward_breakdown_per_turn": per_turn_components,
                 "forward_sim_correctness_avg": sum(forward_sim_correctness) / len(forward_sim_correctness) if forward_sim_correctness else 0.0,
             }
 
-        # Sparse reward: only diagnosis turn gets substantial reward, questions get small cost
-        if self.reward_sparse:
-            budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
-            diagnosis_component = self.diagnosis_reward_weight * correctness
-            budget_component = self.budget_reward_weight * budget_fraction
-            diagnosis_reward = diagnosis_component + budget_component
-
-            per_turn_rewards = []
-            for turn in state.turns:
-                if turn.action.type == "diagnosis":
-                    # Diagnosis turn gets full reward
-                    per_turn_rewards.append(diagnosis_reward)
-                    per_turn_components[len(per_turn_rewards) - 1] = {
-                        "diagnosis": diagnosis_component,
-                        "budget": budget_component,
-                        "question": 0.0,
-                    }
-                else:
-                    # Question turns get small cost (negative reward encourages efficiency)
-                    question_penalty = -self.question_cost
-                    per_turn_rewards.append(question_penalty)
-                    per_turn_components[len(per_turn_rewards) - 1] = {
-                        "diagnosis": 0.0,
-                        "budget": 0.0,
-                        "question": question_penalty,
-                    }
-
-            reward = sum(per_turn_rewards)
-
-            if self.debug_print or self.reward_breakdown_debug:
-                print(
-                    f"[Episode {state.scenario_id}] Sparse reward | "
-                    f"correctness={correctness:.3f} (w={self.diagnosis_reward_weight}) | "
-                    f"budget={budget_fraction:.3f} (w={self.budget_reward_weight}) | "
-                    f"question_cost={self.question_cost:.3f} | total={reward:.3f}"
-                )
-                if per_turn_components:
-                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (sparse):")
-                    for idx, (turn, components, total) in enumerate(
-                        zip(state.turns, per_turn_components, per_turn_rewards), start=1
-                    ):
-                        print(
-                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
-                            "diagnosis={diag:.3f} | budget={budget:.3f} | question={q:.3f}".format(
-                                turn_idx=idx,
-                                action=turn.action.type,
-                                total=total,
-                                diag=components["diagnosis"],
-                                budget=components["budget"],
-                                q=components["question"],
-                            )
-                        )
-
-            return reward, {
-                "correctness": correctness,
-                "budget_saved": budget_fraction,
-                "question_reward": sum(r for r in per_turn_rewards if r < 0),
-                "moderator_decision": moderator_decision,
-                "reward_per_turn": per_turn_rewards,
-                "reward_breakdown_per_turn": per_turn_components,
-            }
-
-        if self.reward_correctness_baseline:
-            diagnosis_component = self.diagnosis_reward_weight * correctness
-            per_turn_components = [
-                {"diagnosis": diagnosis_component, "budget": 0.0, "question": 0.0}
-                for _ in state.turns
-            ]
-            per_turn_rewards = [diagnosis_component for _ in state.turns]
-            reward = diagnosis_component
-
-            if self.debug_print or self.reward_breakdown_debug:
-                print(
-                    f"[Episode {state.scenario_id}] Baseline reward (diagnosis correctness only) | "
-                    f"correctness={correctness:.3f} (w={self.diagnosis_reward_weight}) | total={reward:.3f}"
-                )
-                if per_turn_components:
-                    print(f"[Episode {state.scenario_id}] Per-turn reward breakdown (baseline):")
-                    for idx, (turn, components, total) in enumerate(
-                        zip(state.turns, per_turn_components, per_turn_rewards), start=1
-                    ):
-                        print(
-                            "  Turn {turn_idx} ({action}): total={total:.3f} | "
-                            "diagnosis={diag:.3f}".format(
-                                turn_idx=idx,
-                                action=turn.action.type,
-                                total=total,
-                                diag=components["diagnosis"],
-                            )
-                        )
-
-            return reward, {
-                "correctness": correctness,
-                "budget_saved": state.remaining_budget / float(max(state.max_turns, 1)),
-                "question_reward": 0.0,
-                "moderator_decision": moderator_decision,
-                "reward_per_turn": per_turn_rewards or [reward],
-                "reward_breakdown_per_turn": per_turn_components,
-            }
-
-        if total_questions > 0 and self.question_reward_weight != 0.0:
-            question_counter = 0
-            for idx, turn in enumerate(state.turns):
-                action = turn.action
-                if action.type == "diagnosis":
-                    continue
-                # Use counter BEFORE incrementing (0-indexed: first question gets i=0)
-                base = max((total_questions - question_counter) / total_questions, 0.0)
-                temporal_weight = base ** self.temporal_decay_beta
-                try:
-                    if self.debug_print:
-                        print(f"Computing question confidence gain for turn {idx + 1} of {total_questions}")
-                    utility = self._question_confidence_gain(
-                        state=state,
-                        turn=turn,
-                        turn_idx=idx,
-                        generate_fn=generate_fn,
-                    )
-                except Exception as exc:
-                    utility = 0.0
-                    if not self._utility_warning_emitted:
-                        logger.warning(
-                            "Question utility computation failed (%s); defaulting to 0.0.",
-                            exc,
-                        )
-                        self._utility_warning_emitted = True
-                question_component = temporal_weight * utility
-                question_reward_total += question_component
-                if per_turn_components:
-                    per_turn_components[idx]["question"] += (
-                        self.question_reward_weight * question_component
-                    )
-                # Increment counter AFTER computing weight (moves to next 0-indexed position)
-                question_counter += 1
-
-        budget_fraction = state.remaining_budget / float(max(state.max_turns, 1))
-        diagnosis_component = self.diagnosis_reward_weight * correctness
-        budget_component = self.budget_reward_weight * budget_fraction
-        question_component_weighted = self.question_reward_weight * question_reward_total
-
-        reward = diagnosis_component + budget_component + question_component_weighted
-
-        if per_turn_components:
-            diagnosis_turn_idx = next(
-                (
-                    idx
-                    for idx, turn in enumerate(state.turns)
-                    if turn.action.type == "diagnosis"
-                ),
-                len(state.turns) - 1,
-            )
-            per_turn_components[diagnosis_turn_idx]["diagnosis"] += diagnosis_component
-            per_turn_components[diagnosis_turn_idx]["budget"] += budget_component
-
-        per_turn_rewards = [sum(comp.values()) for comp in per_turn_components]
-
-        if self.debug_print or self.reward_breakdown_debug:
-            print(
-                f"[Episode {state.scenario_id}] Reward components | "
-                f"diagnosis={correctness:.3f} (w={self.diagnosis_reward_weight}) | "
-                f"budget={budget_fraction:.3f} (w={self.budget_reward_weight}) | "
-                f"question={question_reward_total:.3f} (w={self.question_reward_weight}) | "
-                f"total={reward:.3f}"
-            )
-            if per_turn_components:
-                print(f"[Episode {state.scenario_id}] Per-turn reward breakdown:")
-                for idx, (turn, components, total) in enumerate(
-                    zip(state.turns, per_turn_components, per_turn_rewards), start=1
-                ):
-                    print(
-                        "  Turn {turn_idx} ({action}): total={total:.3f} | "
-                        "diagnosis={diag:.3f} | budget={budget:.3f} | question={question:.3f}".format(
-                            turn_idx=idx,
-                            action=turn.action.type,
-                            total=total,
-                            diag=components["diagnosis"],
-                            budget=components["budget"],
-                            question=components["question"],
-                        )
-                    )
-        return reward, {
-            "correctness": correctness,
-            "budget_saved": budget_fraction,
-            "question_reward": question_reward_total,
-            "moderator_decision": moderator_decision,
-            "reward_per_turn": per_turn_rewards,
-            "reward_breakdown_per_turn": per_turn_components,
-        }
-
-    def _question_confidence_gain(
-        self,
-        state: DoctorEpisodeState,
-        turn: EpisodeTurn,
-        turn_idx: int,
-        generate_fn,
-    ) -> float:
-        history_before = turn.history_before
-        history_after = copy.deepcopy(history_before)
-        history_after.append({"role": "doctor", "content": turn.action.text})
-        if turn.reply_role and turn.reply_text:
-            history_after.append({"role": turn.reply_role, "content": turn.reply_text})
-
-        before_confidence = self._diagnosis_confidence_from_history(
-            state=state,
-            history=history_before,
-            generate_fn=generate_fn,
-            scenario_id=state.scenario_id,
-            turn_idx=turn_idx,
-            probe_label="before",
+        # Archived reward modes (sparse, correctness_baseline, dense) have been moved to reward_modes.py
+        # Only forward simulation reward is supported in the main implementation
+        raise ValueError(
+            "No reward mode enabled. Please use --reward_forward_sim flag. "
+            "Other reward modes (sparse, dense, correctness_baseline) have been archived to reward_modes.py"
         )
-        after_confidence = self._diagnosis_confidence_from_history(
-            state=state,
-            history=history_after,
-            generate_fn=generate_fn,
-            scenario_id=state.scenario_id,
-            turn_idx=turn_idx,
-            probe_label="after",
-        )
-
-        gain = after_confidence - before_confidence
-        if self.debug_print:
-            print(
-                f"[Episode {state.scenario_id}] Confidence delta | "
-                f"turn={turn_idx + 1} type={turn.action.type} | "
-                f"before={before_confidence:.3f} | "
-                f"after={after_confidence:.3f} | "
-                f"gain={gain:.3f}"
-            )
-        return gain
-
-    def _diagnosis_confidence_from_history(
-        self,
-        state: DoctorEpisodeState,
-        history: Sequence[Dict[str, str]],
-        generate_fn,
-        scenario_id: Optional[int],
-        turn_idx: Optional[int],
-        probe_label: str,
-    ) -> float:
-        system_prompt, prompt = self._build_diagnosis_assessment_query(state, history)
-        model_input = self._format_model_input(system_prompt, prompt)
-        _, _, response_text = generate_fn(
-            model_input,
-            scenario_id=scenario_id,
-            turn_idx=turn_idx,
-        )
-        confidence = self._parse_confidence_response(response_text)
-        if self.debug_print:
-            print(
-                f"[Episode {scenario_id}] Confidence probe ({probe_label}) -> "
-                f"{confidence:.3f}"
-            )
-        return confidence
-
-    def _build_diagnosis_assessment_query(
-        self,
-        state: DoctorEpisodeState,
-        history: Sequence[Dict[str, str]],
-    ) -> Tuple[str, str]:
-        examiner_context = _stringify_context(state.scenario.examiner_information())
-        history_text = self._format_history_for_prompt(history)
-
-        system_prompt = (
-            "You are Dr. Agent reviewing an ongoing patient encounter. "
-            "Based solely on the conversation so far, provide your single best "
-            "tentative diagnosis, after first explaining the reasoning for your diagnosis, and estimate your confidence as a probability "
-            "between 0 and 1. Respond ONLY with a JSON object containing the keys "
-            "\"diagnosis\", \"reasoning\", and \"confidence\"."
-        )
-        prompt_parts = [
-            "Examiner guidance:",
-            examiner_context or "None provided.",
-            "",
-            "Conversation transcript:",
-            history_text or "No dialogue yet.",
-            "",
-            "Provide your current assessment now.",
-        ]
-        prompt = "\n".join(prompt_parts)
-        return system_prompt, prompt
-
-    @staticmethod
-    def _format_history_for_prompt(history: Sequence[Dict[str, str]]) -> str:
-        if not history:
-            return ""
-        lines: List[str] = []
-        for turn in history:
-            role = turn.get("role", "").capitalize() or "Unknown"
-            content = turn.get("content", "")
-            lines.append(f"{role}: {content}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _clamp_probability(value: float) -> float:
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        if value != value:  # NaN check
-            return 0.0
-        return max(0.0, min(1.0, value))
-
-    @staticmethod
-    def _parse_confidence_response(text: str) -> float:
-        if not text:
-            return 0.0
-        cleaned = text.strip()
-
-        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if json_match:
-            try:
-                payload = json.loads(json_match.group(0))
-                confidence_value = payload.get("confidence")
-                if confidence_value is not None:
-                    value = float(confidence_value)
-                    if abs(value) > 1.0:
-                        value /= 100.0
-                    return AgentClinicSimulator._clamp_probability(value)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-
-        key_match = re.search(
-            r"confidence[^0-9\-]*(-?\d+(?:\.\d+)?)", cleaned, re.IGNORECASE
-        )
-        if key_match:
-            try:
-                value = float(key_match.group(1))
-                if abs(value) > 1.0:
-                    value /= 100.0
-                return AgentClinicSimulator._clamp_probability(value)
-            except ValueError:
-                pass
-
-        number_match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-        if number_match:
-            try:
-                value = float(number_match.group(0))
-                if abs(value) > 1.0:
-                    value /= 100.0
-                return AgentClinicSimulator._clamp_probability(value)
-            except ValueError:
-                pass
-
-        return 0.0
 
     def _forward_simulate_from_turn(
         self,
-        original_state: DoctorEpisodeState,
-        turn_idx: int,
+        state: DoctorEpisodeState,
         generate_fn,
     ) -> float:
         """
-        Forward simulate episode from turn_idx to get expected correctness.
+        Forward simulate episode from states_idx to get expected correctness.
 
         This implements per-turn credit assignment by simulating what happens
         if we start from this turn and continue to the end.
 
         Process:
         1. Create fresh state for same scenario
-        2. Replay turns [0, turn_idx] with exact same doctor actions
+        2. Restore state from snapshot AFTER turn_idx (O(1) instead of O(turn_idx) replay!)
         3. Generate fresh turns [turn_idx+1, ...] until diagnosis (deterministic)
         4. Return final correctness
 
@@ -1164,118 +662,30 @@ class AgentClinicSimulator:
         Returns:
             Correctness (0.0 or 1.0) of forward-simulated episode
         """
-        # Create fresh state for same scenario
-        sim_state = self.reset(original_state.scenario)
 
-        # Replay turns [0, turn_idx] with exact same doctor actions
-        for replay_idx in range(turn_idx + 1):
-            if replay_idx >= len(original_state.turns):
-                # Safety: should not happen
-                break
+        # state ends with doctor's action. Apply action.
 
-            original_turn = original_state.turns[replay_idx]
-            original_action = original_turn.action
+        action = state.actions[-1]
+        _, _ = self._apply_action(state, action)
 
-            # Capture state before this turn
-            history_before = [dict(turn) for turn in sim_state.history]
-            patient_hist_before = sim_state.patient_agent.get_hist()
-            measurement_hist_before = sim_state.measurement_agent.get_hist()
-            remaining_budget_before = sim_state.remaining_budget
-
-            # Build prompt for this turn (returns tuple: prompt, system_prompt)
-            prev_role = sim_state.history[-1]["role"] if sim_state.history else None
-            prev_text = sim_state.history[-1]["content"] if sim_state.history else None
-            prompt_str, system_prompt_str = self.build_prompt(sim_state, prev_role, prev_text)
-
-            # Apply the action to get patient/measurement response
-            reply_role, reply_text = self._apply_action(sim_state, original_action)
-
-            # Store the turn with all required fields
-            sim_state.turns.append(
-                EpisodeTurn(
-                    prompt=prompt_str,
-                    doctor_text=original_action.text,
-                    query_tensor=original_turn.query_tensor,  # Reuse from original
-                    response_tensor=original_turn.response_tensor,  # Reuse from original
-                    action=original_action,
-                    reply_role=reply_role,
-                    reply_text=reply_text,
-                    history_before=history_before,
-                    patient_hist_before=patient_hist_before,
-                    measurement_hist_before=measurement_hist_before,
-                    remaining_budget_before=remaining_budget_before,
-                )
-            )
-
-            # If this was the diagnosis action, we're done with replay
-            if original_action.type == "diagnosis":
-                break
-
-        # If we're at the last turn of original episode, no need to continue
-        if turn_idx >= len(original_state.turns) - 1:
-            # Just evaluate correctness of replayed diagnosis
-            correctness, _ = self._evaluate_correctness(sim_state)
-            return correctness
-
-        # Continue generating fresh turns from turn_idx+1 until diagnosis
-        # Use deterministic generation (temperature controlled by forward_sim_temperature)
-        max_additional_turns = sim_state.max_turns - len(sim_state.actions)
-
-        for _ in range(max_additional_turns):
-            if sim_state.done:
-                break
-
-            # Capture state before this turn
-            history_before = [dict(turn) for turn in sim_state.history]
-            patient_hist_before = sim_state.patient_agent.get_hist()
-            measurement_hist_before = sim_state.measurement_agent.get_hist()
-            remaining_budget_before = sim_state.remaining_budget
-
-            # Get last reply for context
-            prev_role = sim_state.history[-1]["role"] if sim_state.history else None
-            prev_text = sim_state.history[-1]["content"] if sim_state.history else None
-
+        while not state.done:
             # Build prompt (returns tuple: prompt, system_prompt)
-            prompt_str, system_prompt_str = self.build_prompt(sim_state, prev_role, prev_text)
+            prompt_str, system_prompt_str = self.build_prompt_for_doctor(state)
             model_input = self._format_model_input(system_prompt_str, prompt_str)
 
             # Generate with deterministic temperature
             # Note: generate_fn uses the configured temperature
-            query_tensor, response_tensor, doctor_response = generate_fn(
-                model_input,
-                scenario_id=sim_state.scenario_id,
-                turn_idx=len(sim_state.actions),
-            )
-
-            # Parse action
+            _, response_tensor, doctor_response = generate_fn(model_input)
             action = parse_action(doctor_response)
+            state.actions.append(action)
+            state.add_turn("doctor", action.text)
+            state.total_num_tokens += len(response_tensor)
 
-            # Apply action
-            reply_role, reply_text = self._apply_action(sim_state, action)
-
-            # Store turn with all required fields
-            sim_state.turns.append(
-                EpisodeTurn(
-                    prompt=prompt_str,
-                    doctor_text=doctor_response,
-                    query_tensor=query_tensor,
-                    response_tensor=response_tensor,
-                    action=action,
-                    reply_role=reply_role,
-                    reply_text=reply_text,
-                    history_before=history_before,
-                    patient_hist_before=patient_hist_before,
-                    measurement_hist_before=measurement_hist_before,
-                    remaining_budget_before=remaining_budget_before,
-                )
-            )
-
-            if sim_state.done:
-                break
+            _, _ = self._apply_action(state, action)
 
         # Evaluate final correctness
-        correctness, _ = self._evaluate_correctness(sim_state)
-        return correctness
+        correctness, _ = self._evaluate_correctness(state)
+        return correctness, state.total_num_tokens
 
     def _evaluate_correctness(
         self, state: DoctorEpisodeState
@@ -1423,41 +833,6 @@ def load_reference_model(
 # ---------------------------------------------------------------------------
 
 
-class CheckpointManager:
-    def __init__(self, base_dir: str, limit: Optional[int]) -> None:
-        self.base_dir = base_dir
-        self.limit = limit if limit and limit > 0 else None
-        self.paths: List[str] = []
-
-    def register(self, path: str) -> None:
-        if self.limit is None:
-            return
-        self.paths.append(path)
-        if len(self.paths) > self.limit:
-            old = self.paths.pop(0)
-            if os.path.isdir(old):
-                shutil.rmtree(old, ignore_errors=True)
-                logger.info("Removed old checkpoint at %s (save_total_limit=%s)", old, self.limit)
-
-
-def save_checkpoint(
-    trainer: PPOTrainer,
-    tokenizer: AutoTokenizer,
-    output_dir: str,
-    name: str,
-    manager: CheckpointManager,
-) -> None:
-    if not getattr(trainer.accelerator, "is_main_process", True):
-        return
-
-    path = os.path.join(output_dir, name)
-    os.makedirs(path, exist_ok=True)
-    trainer.save_pretrained(path)
-    tokenizer.save_pretrained(path)
-    manager.register(path)
-    logger.info("Saved checkpoint to %s", path)
-
-
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -1472,63 +847,6 @@ def prepare_generation_kwargs(args, tokenizer: AutoTokenizer) -> Dict:
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
     }
-
-
-def verify_ppo_gradients(trainer: PPOTrainer, stats: Dict[str, Any], context: str) -> None:
-    """Debug helper to ensure PPO gradients remain finite."""
-
-    grad_norm_value: Optional[float] = None
-    grad_norm = stats.get("ppo/grad_norm")
-    if grad_norm is not None:
-        try:
-            grad_norm_value = float(grad_norm)
-        except (TypeError, ValueError):
-            grad_norm_value = None
-        if grad_norm_value is not None and not math.isfinite(grad_norm_value):
-            raise ValueError(
-                f"Reported PPO grad norm is non-finite after {context}: {grad_norm_value}"
-            )
-
-    missing_grad_params: List[str] = []
-    non_finite_params: List[str] = []
-    max_param_norm = 0.0
-    params_with_grad = 0
-
-    with torch.no_grad():
-        model = trainer.accelerator.unwrap_model(trainer.model)
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            grad = param.grad
-            if grad is None:
-                missing_grad_params.append(name)
-                continue
-            params_with_grad += 1
-            if not torch.isfinite(grad).all():
-                non_finite_params.append(name)
-                continue
-            param_norm = grad.detach().float().norm(2).item()
-            if param_norm > max_param_norm:
-                max_param_norm = param_norm
-
-    if non_finite_params:
-        sample = ", ".join(non_finite_params[:5])
-        raise ValueError(
-            f"Non-finite gradients detected after PPO step ({context}) in parameters: {sample}"
-        )
-
-    report_parts = [
-        f"[PPO Gradient Debug] {context}",
-        f"params_with_grad={params_with_grad}",
-    ]
-    if grad_norm_value is not None:
-        report_parts.append(f"reported_grad_norm={grad_norm_value:.6f}")
-    if max_param_norm > 0.0:
-        report_parts.append(f"max_param_grad_norm={max_param_norm:.6f}")
-    if missing_grad_params:
-        report_parts.append(f"params_missing_grad={len(missing_grad_params)}")
-
-    print(" | ".join(report_parts))
 
 
 def train(args) -> None:
@@ -1565,12 +883,8 @@ def train(args) -> None:
         question_reward_weight=args.question_reward_weight,
         diagnosis_reward_weight=args.diagnosis_reward_weight,
         seed=args.seed,
-        patient_bias=args.patient_bias,
-        doctor_bias=args.doctor_bias,
         debug_print=args.debug_print,
         reward_breakdown_debug=args.print_reward_breakdown or args.debug_print,
-        reward_correctness_baseline=args.reward_correctness_baseline,
-        reward_sparse=args.reward_sparse,
         reward_forward_sim=args.reward_forward_sim,
         intrinsic_token_weight=args.intrinsic_token_weight,
         intrinsic_turn_weight=args.intrinsic_turn_weight,
@@ -1609,20 +923,12 @@ def train(args) -> None:
     policy_model = trainer.accelerator.unwrap_model(trainer.model).pretrained_model
 
     def generate_response(
-        prompt: str,
-        scenario_id: Optional[int] = None,
-        turn_idx: Optional[int] = None,
+        prompt: Tuple[str, str],
     ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
-        if isinstance(prompt, tuple):
-            system_prompt_text, user_prompt_text = prompt
-            system_prompt_text = system_prompt_text or ""
-        else:
-            system_prompt_text = ""
-            user_prompt_text = prompt
+        system_prompt_text, user_prompt_text = prompt
 
         chat_messages: List[Dict[str, str]] = []
-        if system_prompt_text:
-            chat_messages.append({"role": "system", "content": system_prompt_text})
+        chat_messages.append({"role": "system", "content": system_prompt_text})
         chat_messages.append({"role": "user", "content": user_prompt_text})
 
         if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
@@ -1642,20 +948,6 @@ def train(args) -> None:
         query_tensors = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
 
-        # if args.debug_print:
-        #     print("\n----- GENERATION REQUEST -----", flush=True)
-        #     print(
-        #         f"Scenario: {scenario_id} | Turn: {turn_idx} | Prompt tokens: {query_tensors.shape[-1]}",
-        #         flush=True,
-        #     )
-        #     print(
-        #         f"Sampling kwargs: {generation_kwargs}",
-        #         flush=True,
-        #     )
-        #     if system_prompt_text:
-        #         print("[System Prompt]\n" + system_prompt_text, flush=True)
-        #     print("[Prompt]\n" + user_prompt_text, flush=True)
-
         # Keep model in training mode during PPO rollout (following CollabLLM)
         # This ensures policy consistency between data collection and optimization
         with torch.no_grad():
@@ -1669,11 +961,11 @@ def train(args) -> None:
         if generated_tokens.shape[-1] == 0:
             generated_tokens = output_tensors[:, -1:]
 
-        query_tensor = query_tensors.squeeze(0).detach()
+        input_tensor = query_tensors.squeeze(0).detach()
         response_tensor = generated_tokens.squeeze(0).detach()
         response_text = tokenizer.decode(response_tensor, skip_special_tokens=True).strip()
 
-        return query_tensor, response_tensor, response_text
+        return input_tensor, response_tensor, response_text
 
     global_step = 0
     episodes_completed = 0
@@ -1694,44 +986,24 @@ def train(args) -> None:
         epoch_turns: List[int] = []
 
         for scenario_idx in scenario_indices:
-            state, episode_info = simulator.run_episode(scenario_idx, generate_response)
-            turns = state.turns
-            if not turns:
-                continue
+            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
 
-            reward_value = episode_info.pop("reward")
-            turn_rewards = episode_info.pop("reward_per_turn", None)
-            turn_breakdown = episode_info.pop("reward_breakdown_per_turn", None)
-            if turn_breakdown and len(turn_breakdown) == len(turns):
-                breakdown_totals = [sum(components.values()) for components in turn_breakdown]
-                if turn_rewards is None:
-                    turn_rewards = breakdown_totals
-            if not turn_rewards or len(turn_rewards) != len(turns):
-                turn_rewards = [reward_value for _ in turns]
-                turn_breakdown = None
-
-            # Collect all turns from the episode
-            query_tensors = [turn.query_tensor for turn in turns]
-            response_tensors = [turn.response_tensor for turn in turns]
-            reward_tensors = [
-                torch.tensor([r], device=device, dtype=torch.float32)
-                for r in turn_rewards
-            ]
+            multi_turn_rewards = episode_info.pop("reward")
+            reward_value = sum(multi_turn_rewards)
+            reward_tensors = torch.tensor(multi_turn_rewards, device=device, dtype=torch.float32)
 
             # Update batch_size to match the number of turns in this episode
-            trainer.config.batch_size = len(turns)
+            trainer.config.batch_size = len(input_tensors)
 
             # Single trainer.step() call with all turns from the episode
-            stats = trainer.step(query_tensors, response_tensors, reward_tensors)
+            stats = trainer.step(input_tensors, response_tensors, reward_tensors)
 
             # Prepare batch data for logging
             batch_data = {
-                "prompt": [turn.prompt for turn in turns],
-                "response": [turn.doctor_text for turn in turns],
-                "reward": turn_rewards,
-                "scenario_id": [state.scenario_id] * len(turns),
-                "turn_index": list(range(len(turns))),
-                "action_type": [turn.action.type for turn in turns],
+                "scenario_id": scenario_idx,
+                "input_tensors": input_tensors,
+                "response_tensors": response_tensors,
+                "reward_tensors": reward_tensors,
             }
 
             # Log stats once for the entire episode
@@ -1742,7 +1014,7 @@ def train(args) -> None:
                 verify_ppo_gradients(
                     trainer,
                     stats,
-                    context=f"epoch={epoch + 1},scenario={state.scenario_id},num_turns={len(turns)}",
+                    context=f"epoch={epoch + 1},scenario={scenario_idx},num_turns={len(input_tensors)}",
                 )
 
             if trainer.accelerator.is_main_process:
@@ -1752,32 +1024,32 @@ def train(args) -> None:
                     if isinstance(value, (int, float))
                 }
                 scalar_logs["episode/reward"] = reward_value
-                scalar_logs["episode/num_turns"] = len(turns)
+                scalar_logs["episode/num_turns"] = len(input_tensors)
                 trainer.accelerator.log(scalar_logs)
 
-            global_step += len(turns)
+            global_step += len(input_tensors)
             episodes_completed += 1
 
             # Track overall metrics
             episode_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
-                    "num_turns": len(turns),
+                    "num_turns": len(input_tensors),
                 }
             )
 
             # Track epoch-level metrics
             epoch_rewards.append(reward_value)
             epoch_correctness.append(episode_info.get("correctness", 0.0))
-            epoch_turns.append(len(turns))
+            epoch_turns.append(len(input_tensors))
 
             if args.logging_steps and global_step % args.logging_steps == 0:
                 logger.info(
                     "step=%s epoch=%s scenario=%s turns=%s reward=%.3f correctness=%.3f",
                     global_step,
                     epoch + 1,
-                    state.scenario_id,
-                    len(turns),
+                    scenario_idx,
+                    len(input_tensors),
                     reward_value,
                     episode_info.get("correctness", 0.0),
                 )
@@ -1959,47 +1231,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the patient agent (prefixed with HF_)")
     parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for the measurement agent (prefixed with HF_)")
     parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct", help="LLM backend for moderator rewards (prefixed with HF_)")
-    parser.add_argument(
-        "--doctor_bias",
-        type=str,
-        default="None",
-        choices=[
-            "None",
-            "recency",
-            "frequency",
-            "false_consensus",
-            "status_quo",
-            "confirmation",
-            "gender",
-            "race",
-            "sexual_orientation",
-            "cultural",
-            "education",
-            "religion",
-            "socioeconomic",
-        ],
-        help="Optional bias prompt injected into the doctor instructions",
-    )
-    parser.add_argument(
-        "--patient_bias",
-        type=str,
-        default="None",
-        choices=[
-            "None",
-            "recency",
-            "frequency",
-            "false_consensus",
-            "self_diagnosis",
-            "gender",
-            "race",
-            "sexual_orientation",
-            "cultural",
-            "education",
-            "religion",
-            "socioeconomic",
-        ],
-        help="Optional bias prompt injected into the patient instructions",
-    )
 
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA adapters for efficient fine-tuning")
     parser.add_argument("--peft_r", type=int, default=32)
@@ -2040,8 +1271,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_print", action="store_true", help="Print interactions and counterfactual details for debugging")
     parser.add_argument("--print_reward_breakdown", action="store_true", help="Print per-turn reward component breakdowns during training")
     parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
-    parser.add_argument("--reward_correctness_baseline", action="store_true", help="Use only diagnosis correctness as reward for every turn")
-    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost (more standard RL)")
     parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards: per-turn extrinsic (forward sim correctness) + intrinsic (token/turn penalties)")
     parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward (e.g., 0.001)")
     parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")

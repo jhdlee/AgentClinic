@@ -48,22 +48,12 @@ def get_run_name(args, max_turns: int, mode: str) -> str:
             f"ep{args.num_train_epochs}",
         ])
 
-        if args.reward_correctness_baseline:
-            parts.append("corr_only")
-        elif args.reward_sparse:
-            parts.append("sparse")
-        elif args.reward_forward_sim:
+        if args.reward_forward_sim:
             parts.append("fwd_sim")
             if args.intrinsic_token_weight != 0.001:  # Only add if non-default
                 parts.append(f"tw{args.intrinsic_token_weight}")
             if args.intrinsic_turn_weight != 0.0:  # Only add if non-default
                 parts.append(f"turw{args.intrinsic_turn_weight}")
-        else:
-            parts.extend([
-                f"dw{args.diagnosis_reward_weight}",
-                f"bw{args.budget_reward_weight}",
-                f"qw{args.question_reward_weight}",
-            ])
 
         if args.use_lora:
             parts.append("lora")
@@ -110,10 +100,6 @@ def sweep_training(args, max_turns_values: List[int]) -> Dict[int, Dict[str, Any
             cmd.append("--use_4bit")
         if args.disable_reference_model:
             cmd.append("--disable_reference_model")
-        if args.reward_correctness_baseline:
-            cmd.append("--reward_correctness_baseline")
-        if args.reward_sparse:
-            cmd.append("--reward_sparse")
         if args.reward_forward_sim:
             cmd.append("--reward_forward_sim")
             cmd.extend(["--intrinsic_token_weight", str(args.intrinsic_token_weight)])
@@ -180,10 +166,6 @@ def sweep_evaluation(args, max_turns_values: List[int]) -> Dict[int, Dict[str, A
             cmd.append("--use_4bit")
         if args.eval_train:
             cmd.append("--eval_train")
-        if args.reward_correctness_baseline:
-            cmd.append("--reward_correctness_baseline")
-        if args.reward_sparse:
-            cmd.append("--reward_sparse")
         if args.reward_forward_sim:
             cmd.append("--reward_forward_sim")
             cmd.extend(["--intrinsic_token_weight", str(args.intrinsic_token_weight)])
@@ -260,8 +242,6 @@ def main():
     parser.add_argument("--diagnosis_reward_weight", type=float, default=1.0)
     parser.add_argument("--budget_reward_weight", type=float, default=1.0)
     parser.add_argument("--question_reward_weight", type=float, default=1.0)
-    parser.add_argument("--reward_correctness_baseline", action="store_true")
-    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward (standard RL)")
     parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards")
     parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token")
     parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn")

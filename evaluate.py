@@ -101,12 +101,8 @@ def evaluate(args) -> None:
         question_reward_weight=args.question_reward_weight,
         diagnosis_reward_weight=args.diagnosis_reward_weight,
         seed=args.seed,
-        patient_bias=args.patient_bias,
-        doctor_bias=args.doctor_bias,
         debug_print=args.debug_print,
         reward_breakdown_debug=args.print_reward_breakdown,
-        reward_correctness_baseline=args.reward_correctness_baseline,
-        reward_sparse=args.reward_sparse,
         reward_forward_sim=args.reward_forward_sim,
         intrinsic_token_weight=args.intrinsic_token_weight,
         intrinsic_turn_weight=args.intrinsic_turn_weight,
@@ -349,8 +345,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patient_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--measurement_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--moderator_llm", type=str, default="HF_Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--doctor_bias", type=str, default="None")
-    parser.add_argument("--patient_bias", type=str, default="None")
 
     parser.add_argument("--use_4bit", action="store_true")
     parser.add_argument("--bf16", action="store_true")
@@ -371,8 +365,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnosis_reward_weight", type=float, default=1.0)
     parser.add_argument("--debug_print", action="store_true")
     parser.add_argument("--print_reward_breakdown", action="store_true")
-    parser.add_argument("--reward_correctness_baseline", action="store_true")
-    parser.add_argument("--reward_sparse", action="store_true", help="Use sparse reward: diagnosis turn gets correctness+budget bonus, question turns get -question_cost")
     parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards: per-turn extrinsic (forward sim correctness) + intrinsic (token/turn penalties)")
     parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward")
     parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")
