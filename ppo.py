@@ -630,12 +630,22 @@ class AgentClinicSimulator:
                 "forward_sim_correctness_avg": sum(forward_sim_correctness) / len(forward_sim_correctness) if forward_sim_correctness else 0.0,
             }
 
-        # Archived reward modes (sparse, correctness_baseline, dense) have been moved to reward_modes.py
-        # Only forward simulation reward is supported in the main implementation
-        raise ValueError(
-            "No reward mode enabled. Please use --reward_forward_sim flag. "
-            "Other reward modes (sparse, dense, correctness_baseline) have been archived to reward_modes.py"
-        )
+        # Simple correctness-only reward (for baseline evaluation without forward simulation)
+        # This just returns the final correctness without expensive forward simulation
+        # Useful for evaluating models without training
+        simple_reward = correctness * self.diagnosis_reward_weight
+
+        if self.debug_print or self.reward_breakdown_debug:
+            print(
+                f"[Episode {states[-1].scenario_id}] Simple correctness reward | "
+                f"correctness={correctness:.3f} | "
+                f"reward={simple_reward:.3f}"
+            )
+
+        return simple_reward, {
+            "correctness": correctness,
+            "budget_saved": budget_saved,
+        }
 
     def _forward_simulate_from_turn(
         self,

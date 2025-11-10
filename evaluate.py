@@ -205,14 +205,19 @@ def evaluate(args) -> None:
         train_rewards: List[float] = []
 
         for scenario_idx in train_indices:
-            state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            reward = episode_info.get("reward", 0.0)
+            # Handle both scalar rewards (simple) and list rewards (forward sim)
+            if isinstance(reward, list):
+                reward = sum(reward)
+
             train_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
-                    "num_turns": len(state.turns),
+                    "num_turns": len(input_tensors),
                 }
             )
-            train_rewards.append(episode_info.get("reward", 0.0))
+            train_rewards.append(reward)
 
         total_correct = sum(m["correctness"] for m in train_metrics)
         train_accuracy = total_correct / len(train_metrics)
@@ -243,14 +248,19 @@ def evaluate(args) -> None:
         test_rewards: List[float] = []
 
         for scenario_idx in test_indices:
-            state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            reward = episode_info.get("reward", 0.0)
+            # Handle both scalar rewards (simple) and list rewards (forward sim)
+            if isinstance(reward, list):
+                reward = sum(reward)
+
             test_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
-                    "num_turns": len(state.turns),
+                    "num_turns": len(input_tensors),
                 }
             )
-            test_rewards.append(episode_info.get("reward", 0.0))
+            test_rewards.append(reward)
 
         total_correct = sum(m["correctness"] for m in test_metrics)
         test_accuracy = total_correct / len(test_metrics)
@@ -281,14 +291,19 @@ def evaluate(args) -> None:
         all_rewards: List[float] = []
 
         for scenario_idx in range(scenario_loader.num_scenarios):
-            state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            reward = episode_info.get("reward", 0.0)
+            # Handle both scalar rewards (simple) and list rewards (forward sim)
+            if isinstance(reward, list):
+                reward = sum(reward)
+
             all_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
-                    "num_turns": len(state.turns),
+                    "num_turns": len(input_tensors),
                 }
             )
-            all_rewards.append(episode_info.get("reward", 0.0))
+            all_rewards.append(reward)
 
         total_correct = sum(m["correctness"] for m in all_metrics)
         accuracy = total_correct / len(all_metrics)

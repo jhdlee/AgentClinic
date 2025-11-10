@@ -8,7 +8,8 @@ This guide covers how to run baseline evaluation, forward simulation reward trai
 1. [Baseline Evaluation (No Fine-tuning)](#1-baseline-evaluation-no-fine-tuning)
 2. [Training with Forward Simulation Rewards](#2-training-with-forward-simulation-rewards)
 3. [Hyperparameter Sweeps](#3-hyperparameter-sweeps)
-4. [Key Parameters Explained](#4-key-parameters-explained)
+4. [Plotting Sweep Results](#4-plotting-sweep-results)
+5. [Key Parameters Explained](#5-key-parameters-explained)
 
 ---
 
@@ -16,7 +17,11 @@ This guide covers how to run baseline evaluation, forward simulation reward trai
 
 The baseline evaluation runs the model on AgentClinic scenarios **without any PPO training**. This provides a reference point for comparison.
 
-### Basic Usage
+**Note**: For baseline evaluation, the `--reward_forward_sim` flag is **optional**:
+- **Without** `--reward_forward_sim`: Fast evaluation using simple correctness-based rewards (recommended for baseline)
+- **With** `--reward_forward_sim`: Slower evaluation with forward simulation (useful for comparing reward signals)
+
+### Basic Usage (Fast - Recommended)
 
 ```bash
 python3 evaluate.py \
@@ -35,7 +40,7 @@ python3 evaluate.py \
   --output_dir outputs/baseline_eval
 ```
 
-### Important Baseline Parameters
+### Full Baseline Parameters
 
 ```bash
 python3 evaluate.py \
@@ -153,6 +158,8 @@ python3 sweep_max_turns.py \
   --test_size 10
 ```
 
+**Note**: Omit `--reward_forward_sim` for faster baseline evaluation. Add it only if you want to compare reward computation methods.
+
 ### B. Forward Simulation Training Sweep
 
 Sweep different `max_turns` values **with forward simulation training**:
@@ -236,7 +243,121 @@ outputs/sweep_fwd_sim/
 
 ---
 
-## 4. Key Parameters Explained
+## 4. Plotting Sweep Results
+
+After running a sweep, use [plot_sweep.py](plot_sweep.py) to visualize the results.
+
+### Basic Plotting
+
+The script automatically detects whether you ran training or evaluation:
+
+```bash
+python3 plot_sweep.py --results_dir outputs/sweep_baseline
+```
+
+This will:
+1. Print a summary table of all results
+2. Create two plots:
+   - **Max Turns vs Accuracy**: How accuracy changes with turn limit
+   - **Average Turns Taken vs Accuracy**: Efficiency vs performance tradeoff
+3. Save the plot to `outputs/sweep_baseline/sweep_eval_results.png`
+
+### Example Output
+
+```
+================================================================================
+SWEEP RESULTS SUMMARY (EVAL)
+================================================================================
+Max Turns    Avg Turns    Test Acc     Train Acc
+--------------------------------------------------------------------------------
+2            2.00         0.450        N/A
+3            2.80         0.600        N/A
+4            3.50         0.750        N/A
+5            4.20         0.800        N/A
+================================================================================
+
+Best test accuracy: 0.800 at max_turns=5
+Average turns taken: 4.20
+================================================================================
+```
+
+### Plotting Options
+
+**Specify mode explicitly**:
+```bash
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_fwd_sim \
+  --mode train
+```
+
+**Custom output path**:
+```bash
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_baseline \
+  --save_plot my_custom_plot.png
+```
+
+**Skip summary table** (plot only):
+```bash
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_baseline \
+  --no_summary
+```
+
+### Comparing Baseline vs Trained
+
+To compare baseline and trained models:
+
+```bash
+# Plot baseline results
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_baseline \
+  --mode eval \
+  --save_plot comparison_baseline.png
+
+# Plot trained results
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_fwd_sim \
+  --mode train \
+  --save_plot comparison_trained.png
+```
+
+Then compare the two plots side-by-side!
+
+### What the Plots Show
+
+1. **Max Turns vs Accuracy**:
+   - X-axis: Maximum allowed turns (2, 3, 4, 5, etc.)
+   - Y-axis: Final accuracy on test set
+   - Shows how performance improves with more interaction budget
+
+2. **Average Turns Taken vs Accuracy**:
+   - X-axis: Average number of turns actually used by the model
+   - Y-axis: Final accuracy on test set
+   - Shows efficiency: higher accuracy with fewer turns is better
+   - Helps identify if the model is using its turn budget wisely
+
+### Plotting After "Both" Mode Sweep
+
+If you ran a sweep with `--mode both`, you can plot either the training or evaluation results:
+
+```bash
+# Plot evaluation (baseline) results
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_both \
+  --mode eval \
+  --save_plot sweep_both_eval.png
+
+# Plot training results
+python3 plot_sweep.py \
+  --results_dir outputs/sweep_both \
+  --mode train \
+  --save_plot sweep_both_train.png
+```
+
+---
+
+## 5. Key Parameters Explained
 
 ### Model Parameters
 
@@ -293,7 +414,7 @@ outputs/sweep_fwd_sim/
 ### Example 1: Quick Baseline Test
 
 ```bash
-# Evaluate baseline on 10 scenarios
+# Evaluate baseline on 10 scenarios (fast - no forward simulation)
 python3 evaluate.py \
   --max_scenarios 10 \
   --output_dir outputs/quick_baseline
@@ -314,13 +435,13 @@ python3 ppo.py \
 ### Example 3: Full Experiment Comparison
 
 ```bash
-# Step 1: Baseline evaluation
+# Step 1: Baseline evaluation (fast - no forward simulation)
 python3 evaluate.py \
   --max_scenarios 50 \
   --test_size 10 \
   --output_dir outputs/exp1_baseline
 
-# Step 2: Train with forward simulation
+# Step 2: Train with forward simulation (requires --reward_forward_sim)
 python3 ppo.py \
   --max_scenarios 50 \
   --test_size 10 \
@@ -334,7 +455,7 @@ cat outputs/exp1_baseline/evaluation_results.json
 cat outputs/exp1_trained/evaluation_results.json
 ```
 
-### Example 4: Comprehensive Sweep
+### Example 4: Comprehensive Sweep with Plotting
 
 ```bash
 # Sweep both baseline and training across max_turns
@@ -348,19 +469,109 @@ python3 sweep_max_turns.py \
   --use_lora \
   --base_output_dir outputs/comprehensive_sweep
 
-# Plot results
-python3 plot_sweep.py --results_dir outputs/comprehensive_sweep
+# Plot baseline results
+python3 plot_sweep.py \
+  --results_dir outputs/comprehensive_sweep \
+  --mode eval \
+  --save_plot comprehensive_baseline.png
+
+# Plot training results
+python3 plot_sweep.py \
+  --results_dir outputs/comprehensive_sweep \
+  --mode train \
+  --save_plot comprehensive_trained.png
+```
+
+---
+
+## Complete Workflow Examples
+
+### Workflow 1: Baseline Sweep + Plot
+
+```bash
+# Step 1: Run baseline sweep (fast - no forward simulation)
+python3 sweep_max_turns.py \
+  --mode eval \
+  --max_turns_range 2 3 4 5 6 \
+  --max_scenarios 50 \
+  --test_size 10 \
+  --base_output_dir outputs/baseline_sweep
+
+# Step 2: Plot results
+python3 plot_sweep.py \
+  --results_dir outputs/baseline_sweep
+# Output: outputs/baseline_sweep/sweep_eval_results.png
+```
+
+### Workflow 2: Training Sweep + Plot
+
+```bash
+# Step 1: Run training sweep with forward simulation
+python3 sweep_max_turns.py \
+  --mode train \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 50 \
+  --test_size 10 \
+  --reward_forward_sim \
+  --intrinsic_token_weight 0.001 \
+  --num_train_epochs 3 \
+  --use_lora \
+  --base_output_dir outputs/training_sweep
+
+# Step 2: Plot results
+python3 plot_sweep.py \
+  --results_dir outputs/training_sweep \
+  --mode train
+# Output: outputs/training_sweep/sweep_train_results.png
+```
+
+### Workflow 3: Compare Baseline vs Trained
+
+```bash
+# Step 1: Baseline sweep (fast - no forward simulation)
+python3 sweep_max_turns.py \
+  --mode eval \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 100 \
+  --test_size 20 \
+  --base_output_dir outputs/comparison/baseline
+
+# Step 2: Training sweep (requires --reward_forward_sim)
+python3 sweep_max_turns.py \
+  --mode train \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 100 \
+  --test_size 20 \
+  --reward_forward_sim \
+  --num_train_epochs 5 \
+  --use_lora \
+  --base_output_dir outputs/comparison/trained
+
+# Step 3: Plot both
+python3 plot_sweep.py \
+  --results_dir outputs/comparison/baseline \
+  --save_plot comparison_baseline.png
+
+python3 plot_sweep.py \
+  --results_dir outputs/comparison/trained \
+  --mode train \
+  --save_plot comparison_trained.png
+
+# Now you can compare comparison_baseline.png vs comparison_trained.png!
 ```
 
 ---
 
 ## Notes
 
-1. **Forward simulation is required for training**: You must use `--reward_forward_sim` when running `ppo.py`. The older reward modes have been archived.
+1. **Forward simulation requirements**:
+   - **Training (`ppo.py`)**: REQUIRED - you must use `--reward_forward_sim` flag
+   - **Baseline evaluation (`evaluate.py`)**: OPTIONAL - omit for faster evaluation, or include to compare reward signals
+   - Older reward modes (sparse, dense, correctness_baseline) have been archived
 
 2. **Baseline vs Training**:
-   - Use `evaluate.py` for baseline (no training)
-   - Use `ppo.py` for training with forward simulation
+   - Use `evaluate.py` for baseline (no training) - fast correctness-only evaluation
+   - Use `ppo.py` for training with forward simulation (requires `--reward_forward_sim`)
 
 3. **Memory considerations**:
    - For large models, use `--use_lora --use_4bit`
