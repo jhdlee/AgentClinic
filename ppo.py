@@ -584,8 +584,10 @@ class AgentClinicSimulator:
         generate_fn,
     ) -> Tuple[float, Dict[str, Any]]:
 
-        correctness = self._evaluate_correctness(states[-1])[0]
-        budget_saved = states[-1].remaining_budget / float(max(states[-1].max_turns, 1))
+        last_state = copy.deepcopy(states[-1])
+        _, _ = self._apply_action(last_state, last_state.actions[-1])
+        correctness = self._evaluate_correctness(last_state)[0]
+        budget_saved = last_state.remaining_budget / float(max(last_state.max_turns, 1))
 
         # Forward simulation reward: per-turn extrinsic + intrinsic rewards
         if self.reward_forward_sim:
