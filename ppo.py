@@ -407,6 +407,8 @@ class AgentClinicSimulator:
         target_num_turns: int = 3,
         turn_penalty_weight: float = 0.1,
         turn_reward_weight: float = 0.05,
+        save_llm_outputs: bool = False,
+        output_dir: Optional[str] = None,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -434,10 +436,97 @@ class AgentClinicSimulator:
         self.target_num_turns = target_num_turns
         self.turn_penalty_weight = float(turn_penalty_weight)
         self.turn_reward_weight = float(turn_reward_weight)
+        self.save_llm_outputs = save_llm_outputs
+        self.output_dir = output_dir
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
         return system_prompt, prompt
+
+    def _save_episode_output(
+        self,
+        state: DoctorEpisodeState,
+        epoch: int,
+        episode_num: int,
+        episode_info: Dict[str, Any],
+    ) -> None:
+        """Save episode interactions to a text file for tracking changes over training."""
+        if not self.save_llm_outputs or not self.output_dir:
+            return
+
+        # Create subdirectory for LLM outputs
+        llm_outputs_dir = os.path.join(self.output_dir, "llm_outputs")
+        os.makedirs(llm_outputs_dir, exist_ok=True)
+
+        # Create filename with epoch, episode, and scenario info
+        # Special epoch values: -1 = train eval, -2 = test eval
+        if epoch == -1:
+            epoch_str = "eval_train"
+        elif epoch == -2:
+            epoch_str = "eval_test"
+        else:
+            epoch_str = f"epoch_{epoch:03d}"
+
+        filename = f"{epoch_str}_episode_{episode_num:04d}_scenario_{state.scenario_id:03d}.txt"
+        filepath = os.path.join(llm_outputs_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            # Header with metadata
+            f.write("=" * 80 + "\n")
+            f.write("EPISODE OUTPUT LOG\n")
+            f.write("=" * 80 + "\n")
+            if epoch == -1:
+                f.write("Epoch:              TRAIN EVALUATION\n")
+            elif epoch == -2:
+                f.write("Epoch:              TEST EVALUATION\n")
+            else:
+                f.write(f"Epoch:              {epoch}\n")
+            f.write(f"Episode Number:     {episode_num}\n")
+            f.write(f"Scenario ID:        {state.scenario_id}\n")
+            f.write(f"Number of Turns:    {len(state.actions)}\n")
+            f.write(f"Correctness:        {episode_info.get('correctness', 0.0):.3f}\n")
+            f.write(f"Total Reward:       {episode_info.get('reward', 0.0):.3f}\n")
+            f.write(f"Budget Saved:       {episode_info.get('budget_saved', 0.0):.3f}\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Scenario information
+            f.write("SCENARIO INFORMATION\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Correct Diagnosis:  {state.scenario.diagnosis_information()}\n")
+            f.write(f"Examiner Info:      {state.scenario.examiner_information()}\n")
+            f.write("-" * 80 + "\n\n")
+
+            # Turn-by-turn interactions
+            f.write("INTERACTION HISTORY\n")
+            f.write("=" * 80 + "\n\n")
+
+            turn_num = 0
+            for i, turn in enumerate(state.history):
+                if turn["role"] == "doctor":
+                    turn_num += 1
+                    action = state.actions[turn_num - 1] if turn_num <= len(state.actions) else None
+                    f.write("=" * 80 + "\n")
+                    f.write(f"TURN {turn_num}\n")
+                    f.write("=" * 80 + "\n")
+                    if action:
+                        f.write(f"Action Type: {action.type.upper()}\n")
+                    f.write(f"\n[DOCTOR]\n{turn['content']}\n\n")
+                else:
+                    f.write(f"[{turn['role'].upper()}]\n{turn['content']}\n\n")
+
+            # Final diagnosis (if provided)
+            if state.diagnosis_action:
+                f.write("=" * 80 + "\n")
+                f.write("FINAL DIAGNOSIS\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"{state.diagnosis_action.text}\n\n")
+                f.write(f"Diagnosis Payload:  {state.diagnosis_action.payload}\n")
+                f.write(f"Correct Diagnosis:  {state.scenario.diagnosis_information()}\n")
+                f.write(f"Match:              {'YES' if episode_info.get('correctness', 0.0) > 0 else 'NO'}\n")
+
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("END OF EPISODE\n")
+            f.write("=" * 80 + "\n")
 
     # ------------------------------------------------------------------
     # Episode lifecycle
@@ -521,6 +610,8 @@ class AgentClinicSimulator:
         self,
         scenario_id: int,
         generate_fn,
+        epoch: int = 0,
+        episode_num: int = 0,
     ) -> Tuple[DoctorEpisodeState, Dict[str, float]]:
         state = self.reset_by_id(scenario_id)
 
@@ -560,7 +651,12 @@ class AgentClinicSimulator:
                 print("=" * 60, flush=True)
 
         rewards, components = self._compute_episode_reward(states, generate_fn)
-        return state.input_tensors, state.response_tensors, {"reward": rewards, **components}
+        episode_info = {"reward": rewards, **components}
+
+        # Save episode outputs if enabled
+        self._save_episode_output(state, epoch, episode_num, episode_info)
+
+        return state.input_tensors, state.response_tensors, episode_info
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1121,6 +1217,8 @@ def train(args) -> None:
         target_num_turns=args.target_num_turns,
         turn_penalty_weight=args.turn_penalty_weight,
         turn_reward_weight=args.turn_reward_weight,
+        save_llm_outputs=args.save_llm_outputs,
+        output_dir=output_dir,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1246,7 +1344,9 @@ def train(args) -> None:
         batch_scenario_ids: List[int] = []
 
         for scenario_idx in scenario_pbar:
-            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            input_tensors, response_tensors, episode_info = simulator.run_episode(
+                scenario_idx, generate_response, epoch=epoch + 1, episode_num=episodes_completed
+            )
 
             multi_turn_rewards = episode_info.pop("reward")
             reward_value = sum(multi_turn_rewards)
@@ -1400,8 +1500,10 @@ def train(args) -> None:
         # Evaluate on training set
         train_eval_metrics: List[Dict[str, float]] = []
         logger.info("Evaluating on %d training scenarios...", len(train_indices))
-        for scenario_idx in tqdm(train_indices, desc="Train Evaluation", disable=not trainer.accelerator.is_main_process):
-            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+        for eval_idx, scenario_idx in enumerate(tqdm(train_indices, desc="Train Evaluation", disable=not trainer.accelerator.is_main_process)):
+            input_tensors, response_tensors, episode_info = simulator.run_episode(
+                scenario_idx, generate_response, epoch=-1, episode_num=eval_idx
+            )
             train_eval_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
@@ -1425,8 +1527,10 @@ def train(args) -> None:
         if test_indices:
             test_eval_metrics: List[Dict[str, float]] = []
             logger.info("Evaluating on %d test scenarios...", len(test_indices))
-            for scenario_idx in tqdm(test_indices, desc="Test Evaluation", disable=not trainer.accelerator.is_main_process):
-                input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            for eval_idx, scenario_idx in enumerate(tqdm(test_indices, desc="Test Evaluation", disable=not trainer.accelerator.is_main_process)):
+                input_tensors, response_tensors, episode_info = simulator.run_episode(
+                    scenario_idx, generate_response, epoch=-2, episode_num=eval_idx
+                )
                 test_eval_metrics.append(
                     {
                         "correctness": episode_info.get("correctness", 0.0),
@@ -1557,6 +1661,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_print", action="store_true", help="Print interactions and counterfactual details for debugging")
     parser.add_argument("--print_reward_breakdown", action="store_true", help="Print per-turn reward component breakdowns during training")
     parser.add_argument("--debug_verify_gradients", action="store_true", help="Run PPO gradient health checks after each optimisation step")
+    parser.add_argument("--save_llm_outputs", action="store_true", help="Save LLM interactions to output directory for tracking changes over training")
     parser.add_argument("--reward_forward_sim", action="store_true", help="Use forward simulation rewards: per-turn extrinsic (forward sim correctness) + intrinsic (token/turn penalties)")
     parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward (e.g., 0.001)")
     parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")

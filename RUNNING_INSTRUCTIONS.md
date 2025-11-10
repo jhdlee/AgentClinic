@@ -1,15 +1,16 @@
 # Running Instructions for AgentClinic PPO Training
 
-This guide covers how to run baseline evaluation, forward simulation reward training, and hyperparameter sweeps.
+This guide covers how to run baseline evaluation, forward simulation reward training, budget-aware reward training, and hyperparameter sweeps.
 
 ---
 
 ## Table of Contents
 1. [Baseline Evaluation (No Fine-tuning)](#1-baseline-evaluation-no-fine-tuning)
 2. [Training with Forward Simulation Rewards](#2-training-with-forward-simulation-rewards)
-3. [Hyperparameter Sweeps](#3-hyperparameter-sweeps)
-4. [Plotting Sweep Results](#4-plotting-sweep-results)
-5. [Key Parameters Explained](#5-key-parameters-explained)
+3. [Training with Budget-Aware Rewards](#3-training-with-budget-aware-rewards)
+4. [Hyperparameter Sweeps](#4-hyperparameter-sweeps)
+5. [Plotting Sweep Results](#5-plotting-sweep-results)
+6. [Key Parameters Explained](#6-key-parameters-explained)
 
 ---
 
@@ -138,7 +139,105 @@ After training completes, you'll find:
 
 ---
 
-## 3. Hyperparameter Sweeps
+## 3. Training with Budget-Aware Rewards
+
+The `reward_budget_aware` method trains the model to optimize turn efficiency while maintaining diagnostic accuracy. This reward mode encourages the model to use a target number of turns by:
+- Computing confidence-based question utility (how much each question improves diagnostic confidence)
+- Applying temporal weighting to earlier questions
+- Adding rewards for staying below target turns or penalties for exceeding them
+
+### Basic Budget-Aware Training
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/ppo_budget_aware \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --turn_penalty_weight 0.1 \
+  --turn_reward_weight 0.05 \
+  --num_train_epochs 3 \
+  --max_turns 5 \
+  --learning_rate 1e-6
+```
+
+### Full Budget-Aware Training Example
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --patient_llm HF_Qwen/Qwen2.5-7B-Instruct \
+  --measurement_llm HF_Qwen/Qwen2.5-7B-Instruct \
+  --moderator_llm HF_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/ppo_budget_aware_full \
+  --max_scenarios 50 \
+  --test_size 10 \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --turn_penalty_weight 0.1 \
+  --turn_reward_weight 0.05 \
+  --diagnosis_reward_weight 1.0 \
+  --temporal_decay_beta 1.0 \
+  --num_train_epochs 3 \
+  --learning_rate 1e-6 \
+  --max_turns 5 \
+  --use_lora \
+  --peft_r 32 \
+  --peft_alpha 16 \
+  --seed 42
+```
+
+### Budget-Aware with LoRA and 4-bit Quantization
+
+```bash
+python3 ppo.py \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --dataset_path agentclinic_medqa.jsonl \
+  --output_dir outputs/ppo_budget_aware_4bit \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --turn_penalty_weight 0.1 \
+  --turn_reward_weight 0.05 \
+  --use_lora \
+  --use_4bit \
+  --num_train_epochs 3 \
+  --max_turns 5
+```
+
+### How Budget-Aware Rewards Work
+
+1. **Question Utility**: For each question turn, the reward is based on how much the question increases diagnostic confidence:
+   - Confidence is measured before and after each question
+   - Utility = confidence_after - confidence_before
+   - Temporal weighting: ((N-i)/N)^beta favors earlier questions
+
+2. **Turn Efficiency**:
+   - If actual turns > target turns: apply penalty of `turn_diff * turn_penalty_weight`
+   - If actual turns ≤ target turns: apply reward of `|turn_diff| * turn_reward_weight`
+
+3. **Final Diagnosis**: The last turn receives the diagnosis correctness reward weighted by `diagnosis_reward_weight`
+
+### Budget-Aware Parameters
+
+- `--reward_budget_aware`: Enable budget-aware reward mode (mutually exclusive with `--reward_forward_sim`)
+- `--target_num_turns`: Target number of doctor-patient interactions (default: 3)
+- `--turn_penalty_weight`: Penalty per turn above target (default: 0.1)
+- `--turn_reward_weight`: Reward per turn below target (default: 0.05)
+- `--diagnosis_reward_weight`: Weight for final diagnosis correctness (default: 1.0)
+- `--temporal_decay_beta`: Decay rate for temporal weighting (default: 1.0)
+
+### Training Output
+
+After training completes, you'll find:
+- `{output_dir}/evaluation_results.json` - Final accuracy/metrics on train/test sets
+- `{output_dir}/epoch_stats.json` - Per-epoch training statistics including average question utility and turn efficiency
+- Model checkpoints and weights
+
+---
+
+## 4. Hyperparameter Sweeps
 
 ### Sweep Script Overview
 
@@ -207,6 +306,26 @@ python3 sweep_max_turns.py \
   --use_4bit \
   --num_train_epochs 3 \
   --learning_rate 1e-5
+```
+
+### E. Budget-Aware Training Sweep
+
+Sweep different `max_turns` values **with budget-aware training**:
+
+```bash
+python3 sweep_max_turns.py \
+  --mode train \
+  --max_turns_range 2 3 4 5 \
+  --base_output_dir outputs/sweep_budget_aware \
+  --base_model_name HF_Qwen/Qwen2.5-7B-Instruct \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --turn_penalty_weight 0.1 \
+  --turn_reward_weight 0.05 \
+  --num_train_epochs 3 \
+  --learning_rate 1e-5 \
+  --max_scenarios 50 \
+  --test_size 10
 ```
 
 ### Sweep Output Structure
@@ -379,13 +498,24 @@ python3 plot_sweep.py \
 - `--question_cost`: Budget cost per question (default: 1.0)
 - `--temperature`: Sampling temperature (0.0 = deterministic)
 
-### Forward Simulation Reward Parameters
+### Reward Mode Parameters
 
-- `--reward_forward_sim`: Enable forward simulation rewards (**required for training**)
+**Forward Simulation Rewards:**
+- `--reward_forward_sim`: Enable forward simulation rewards (per-turn credit assignment via counterfactual simulation)
 - `--diagnosis_reward_weight`: Weight for diagnosis correctness (default: 1.0)
 - `--intrinsic_token_weight`: Penalty per token generated (default: 0.001)
 - `--intrinsic_turn_weight`: Penalty per turn taken (default: 0.0)
 - `--forward_sim_temperature`: Temperature for forward simulation (default: 0.0)
+
+**Budget-Aware Rewards:**
+- `--reward_budget_aware`: Enable budget-aware rewards (turn efficiency + confidence-based question utility)
+- `--target_num_turns`: Target number of doctor-patient interactions (default: 3)
+- `--turn_penalty_weight`: Penalty per turn above target (default: 0.1)
+- `--turn_reward_weight`: Reward per turn below target (default: 0.05)
+- `--diagnosis_reward_weight`: Weight for final diagnosis correctness (default: 1.0)
+- `--temporal_decay_beta`: Decay rate for temporal weighting of questions (default: 1.0)
+
+**Note:** `--reward_forward_sim` and `--reward_budget_aware` are mutually exclusive. Use one or the other, not both.
 
 ### Training Parameters
 
@@ -420,7 +550,7 @@ python3 evaluate.py \
   --output_dir outputs/quick_baseline
 ```
 
-### Example 2: Quick Training Test
+### Example 2: Quick Training Test (Forward Simulation)
 
 ```bash
 # Train with forward sim on 10 scenarios for 1 epoch
@@ -430,6 +560,19 @@ python3 ppo.py \
   --reward_forward_sim \
   --num_train_epochs 1 \
   --output_dir outputs/quick_train
+```
+
+### Example 2b: Quick Training Test (Budget-Aware)
+
+```bash
+# Train with budget-aware rewards on 10 scenarios for 1 epoch
+python3 ppo.py \
+  --max_scenarios 10 \
+  --test_size 2 \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --num_train_epochs 1 \
+  --output_dir outputs/quick_train_budget
 ```
 
 ### Example 3: Full Experiment Comparison
@@ -560,23 +703,85 @@ python3 plot_sweep.py \
 # Now you can compare comparison_baseline.png vs comparison_trained.png!
 ```
 
+### Workflow 4: Compare Forward Simulation vs Budget-Aware Training
+
+```bash
+# Step 1: Baseline sweep
+python3 sweep_max_turns.py \
+  --mode eval \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 100 \
+  --test_size 20 \
+  --base_output_dir outputs/comparison/baseline
+
+# Step 2: Forward simulation training
+python3 sweep_max_turns.py \
+  --mode train \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 100 \
+  --test_size 20 \
+  --reward_forward_sim \
+  --intrinsic_token_weight 0.001 \
+  --num_train_epochs 5 \
+  --use_lora \
+  --base_output_dir outputs/comparison/forward_sim
+
+# Step 3: Budget-aware training
+python3 sweep_max_turns.py \
+  --mode train \
+  --max_turns_range 3 4 5 \
+  --max_scenarios 100 \
+  --test_size 20 \
+  --reward_budget_aware \
+  --target_num_turns 3 \
+  --turn_penalty_weight 0.1 \
+  --turn_reward_weight 0.05 \
+  --num_train_epochs 5 \
+  --use_lora \
+  --base_output_dir outputs/comparison/budget_aware
+
+# Step 4: Plot all three
+python3 plot_sweep.py \
+  --results_dir outputs/comparison/baseline \
+  --save_plot comparison_baseline.png
+
+python3 plot_sweep.py \
+  --results_dir outputs/comparison/forward_sim \
+  --mode train \
+  --save_plot comparison_forward_sim.png
+
+python3 plot_sweep.py \
+  --results_dir outputs/comparison/budget_aware \
+  --mode train \
+  --save_plot comparison_budget_aware.png
+
+# Now you can compare all three reward approaches!
+```
+
 ---
 
 ## Notes
 
-1. **Forward simulation requirements**:
-   - **Training (`ppo.py`)**: REQUIRED - you must use `--reward_forward_sim` flag
+1. **Reward mode requirements**:
+   - **Training (`ppo.py`)**: REQUIRED - you must use either `--reward_forward_sim` or `--reward_budget_aware`
    - **Baseline evaluation (`evaluate.py`)**: OPTIONAL - omit for faster evaluation, or include to compare reward signals
+   - The two reward modes are mutually exclusive - use one or the other, not both
    - Older reward modes (sparse, dense, correctness_baseline) have been archived
 
-2. **Baseline vs Training**:
-   - Use `evaluate.py` for baseline (no training) - fast correctness-only evaluation
-   - Use `ppo.py` for training with forward simulation (requires `--reward_forward_sim`)
+2. **Reward mode comparison**:
+   - **Forward Simulation** (`--reward_forward_sim`): Computes per-turn rewards via counterfactual "what-if" simulations
+   - **Budget-Aware** (`--reward_budget_aware`): Optimizes for turn efficiency with a target number of turns
+   - Both support LoRA and 4-bit quantization for memory efficiency
 
-3. **Memory considerations**:
+3. **Baseline vs Training**:
+   - Use `evaluate.py` for baseline (no training) - fast correctness-only evaluation
+   - Use `ppo.py` for training with your chosen reward mode
+
+4. **Memory considerations**:
    - For large models, use `--use_lora --use_4bit`
    - Consider `--disable_reference_model` if memory is tight
+   - Budget-aware rewards may be more memory-efficient than forward simulation as they compute confidence directly rather than running full counterfactual simulations
 
-4. **Reproducibility**: Always set `--seed 42` for reproducible results
+5. **Reproducibility**: Always set `--seed 42` for reproducible results
 
-5. **Sweep organization**: Each sweep run creates a descriptive directory name based on hyperparameters (e.g., `train_mt5_lr1e-05_ep3_fwd_sim_lora`)
+6. **Sweep organization**: Each sweep run creates a descriptive directory name based on hyperparameters (e.g., `train_mt5_lr1e-05_ep3_fwd_sim_lora` or `train_mt5_lr1e-05_ep3_budget_aware`)
