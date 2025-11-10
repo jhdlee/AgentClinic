@@ -156,37 +156,43 @@ def inference_vllm(prompt, llm, max_new_tokens=200, temperature=0.0):
 VLLM_MODELS = {}
 
 def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False, vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9):
+    if clip_prompt:
+        prompt = prompt[:max_prompt_len]
+
+    # Load vLLM model once outside retry loop (if applicable)
+    if isinstance(model, str) and model.startswith("VLLM_"):
+        model_id = model[5:]
+
+        # Load or retrieve cached vLLM model
+        llm = VLLM_MODELS.get(model_id)
+        if llm is None:
+            logger.info("Loading vLLM model: %s", model_id)
+            llm = load_vllm_model(
+                model_id,
+                tensor_parallel_size=vllm_tensor_parallel_size,
+                gpu_memory_utilization=vllm_gpu_memory_utilization
+            )
+            VLLM_MODELS[model_id] = llm
+            logger.info("vLLM model cached: %s", model_id)
+
+        # Retry only the inference part
+        for _ in range(tries):
+            try:
+                input_text = f"{system_prompt}\n\n{prompt}"
+                answer = inference_vllm(input_text, llm)
+                answer = re.sub(r"\s+", " ", answer)
+                return answer
+            except Exception as e:
+                logger.warning("vLLM inference failed, retrying: %s", str(e))
+                time.sleep(timeout)
+                continue
+        raise Exception("Max retries: timeout")
+
+    # For HuggingFace models, keep original retry logic
     for _ in range(tries):
-        if clip_prompt:
-            prompt = prompt[:max_prompt_len]
         try:
             if isinstance(model, str):
-                # Check if vLLM backend is requested
-                if model.startswith("VLLM_"):
-                    # Extract the model id
-                    model_id = model[5:]
-
-                    # Load or retrieve cached vLLM model
-                    llm = VLLM_MODELS.get(model_id)
-                    if llm is None:
-                        llm = load_vllm_model(
-                            model_id,
-                            tensor_parallel_size=vllm_tensor_parallel_size,
-                            gpu_memory_utilization=vllm_gpu_memory_utilization
-                        )
-                        VLLM_MODELS[model_id] = llm
-
-                    # Format the prompt for vLLM
-                    # vLLM doesn't have a tokenizer attribute like HF pipelines
-                    # So we'll use a simple format or rely on the model's training format
-                    input_text = f"{system_prompt}\n\n{prompt}"
-
-                    answer = inference_vllm(input_text, llm)
-                    answer = re.sub(r"\s+", " ", answer)
-
-                    return answer
-
-                elif model.startswith("HF_"):
+                if model.startswith("HF_"):
                     # Extract the HF repo id
                     hf_id = model[3:]
 
