@@ -149,6 +149,7 @@ def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9, v
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
         disable_log_stats=not verbose,  # Disable progress bars unless verbose mode
+        use_tqdm=False,
     )
     return llm
 
@@ -1461,6 +1462,7 @@ def train(args) -> None:
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             trust_remote_code=args.trust_remote_code,
             disable_log_stats=not args.vllm_verbose,  # Disable progress bars unless verbose mode
+            use_tqdm=False,
         )
         logger.info("vLLM policy model loaded successfully")
 
