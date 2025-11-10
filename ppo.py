@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from tqdm import tqdm
 
 try:  # Optional dependency for 4-bit loading
     from transformers import BitsAndBytesConfig
@@ -401,6 +402,10 @@ class AgentClinicSimulator:
         intrinsic_token_weight: float = 0.0,
         intrinsic_turn_weight: float = 0.0,
         forward_sim_temperature: float = 0.0,
+        reward_budget_aware: bool = False,
+        target_num_turns: int = 3,
+        turn_penalty_weight: float = 0.1,
+        turn_reward_weight: float = 0.05,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -424,6 +429,10 @@ class AgentClinicSimulator:
         self.intrinsic_token_weight = float(intrinsic_token_weight)
         self.intrinsic_turn_weight = float(intrinsic_turn_weight)
         self.forward_sim_temperature = float(forward_sim_temperature)
+        self.reward_budget_aware = reward_budget_aware
+        self.target_num_turns = target_num_turns
+        self.turn_penalty_weight = float(turn_penalty_weight)
+        self.turn_reward_weight = float(turn_reward_weight)
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -651,6 +660,90 @@ class AgentClinicSimulator:
                 "forward_sim_correctness_avg": sum(forward_sim_correctness) / len(forward_sim_correctness) if forward_sim_correctness else 0.0,
             }
 
+        # Budget-aware reward: turn efficiency + confidence-based question utility
+        if self.reward_budget_aware:
+            if self.debug_print:
+                print(
+                    f"\n[Episode {states[0].scenario_id}] Computing budget-aware rewards "
+                    f"for {len(states)} turns | actual_correctness={correctness:.3f} | "
+                    f"target_turns={self.target_num_turns}",
+                    flush=True
+                )
+
+            per_turn_rewards = []
+            question_utilities = []
+
+            # Compute confidence before first turn (with no history)
+            conf_before = self._get_diagnosis_confidence(states[0], generate_fn)
+
+            for turn_idx, state in enumerate(states[1:]):
+                # Get confidence after this turn (with response included, before next question)
+                conf_after = self._get_diagnosis_confidence(state, generate_fn)
+
+                utility = conf_after - conf_before
+                question_utilities.append(utility)
+
+                # Apply temporal weighting: ((N-i)/N)^beta
+                N = len(states)
+                temporal_weight = ((N - turn_idx) / N) ** self.temporal_decay_beta
+
+                # Per-turn reward is temporally weighted question utility
+                turn_reward = temporal_weight * utility
+                per_turn_rewards.append(turn_reward)
+
+                if self.debug_print:
+                    print(
+                        f"  [Turn {turn_idx+1}/{len(states)}] "
+                        f"conf_before={conf_before:.3f} | "
+                        f"conf_after={conf_after:.3f} | "
+                        f"utility={utility:.3f} | "
+                        f"temporal_weight={temporal_weight:.3f} | "
+                        f"turn_reward={turn_reward:.4f}",
+                        flush=True
+                    )
+
+                conf_before = conf_after
+
+            # Add turn efficiency reward/penalty to the final turn
+            num_turns = len(states)
+            turn_diff = num_turns - self.target_num_turns
+
+            if turn_diff > 0:
+                # Penalty for exceeding target
+                turn_efficiency = -turn_diff * self.turn_penalty_weight
+            else:
+                # Reward for staying below target
+                turn_efficiency = -turn_diff * self.turn_reward_weight
+
+            # Add final correctness reward to the last turn
+            final_turn_reward = (
+                self.diagnosis_reward_weight * correctness +
+                turn_efficiency
+            )
+            per_turn_rewards.append(final_turn_reward)
+
+            if self.debug_print or self.reward_breakdown_debug:
+                avg_utility = sum(question_utilities) / len(question_utilities) if question_utilities else 0.0
+                print(
+                    f"\n[Episode {states[0].scenario_id}] Budget-aware SUMMARY | "
+                    f"actual_correctness={correctness:.3f} | "
+                    f"num_turns={num_turns} vs target={self.target_num_turns} | "
+                    f"turn_efficiency={turn_efficiency:.3f} | "
+                    f"avg_question_utility={avg_utility:.3f} | "
+                    f"total_reward={sum(per_turn_rewards):.3f} | "
+                    f"reward_per_turn={per_turn_rewards}"
+                )
+                print("=" * 80, flush=True)
+
+            return per_turn_rewards, {
+                "correctness": correctness,
+                "budget_saved": budget_saved,
+                "reward_per_turn": per_turn_rewards,
+                "avg_question_utility": sum(question_utilities) / len(question_utilities) if question_utilities else 0.0,
+                "turn_efficiency": turn_efficiency,
+                "num_turns": num_turns,
+            }
+
         # Simple correctness-only reward (for baseline evaluation without forward simulation)
         # This just returns the final correctness without expensive forward simulation
         # Useful for evaluating models without training
@@ -755,6 +848,88 @@ class AgentClinicSimulator:
                 correctness = 1.0 if moderator_decision.strip().startswith("yes") else 0.0
         return correctness, moderator_decision
 
+    def _get_diagnosis_confidence(
+        self,
+        state: DoctorEpisodeState,
+        generate_fn,
+    ) -> float:
+        """
+        Query the model for its confidence in the top diagnosis.
+
+        Always excludes the most recent doctor question from history to measure
+        confidence after receiving information but before asking the next question.
+
+        Returns confidence score (0.0 = not confident, 1.0 = very confident).
+        """
+        # Build system prompt for confidence estimation (adapted from build_prompt_for_doctor)
+        system_prompt = [
+            "You are a doctor named Dr. Agent analyzing a patient interaction.",
+            "Based on the information gathered, you need to assess your confidence in a diagnosis."
+        ]
+        system_prompt.append("\n\nPatient information:\n{}".format(state.scenario.examiner_information()))
+        system_prompt_str = " ".join(system_prompt)
+
+        # Build conversation history, ALWAYS excluding last doctor turn
+        history_to_use = state.history[:]
+        if history_to_use and history_to_use[-1]['role'] == 'doctor':
+            history_to_use = history_to_use[:-1]
+
+        # Create confidence assessment prompt
+        confidence_prompt = ["\nConversation history so far:"]
+        if history_to_use:
+            history_str = [
+                f"{turn['role'].capitalize()}: {turn['content']}" for turn in history_to_use
+            ]
+            confidence_prompt.append("\n".join(history_str))
+        else:
+            confidence_prompt.append("No dialogue yet.")
+
+        confidence_prompt.append(
+            "\n\nBased on the conversation above, assess your current understanding:\n"
+            "1. Reasoning: Provide your analysis of what you know and what remains uncertain.\n"
+            "2. Diagnosis: State your most likely diagnosis based on current information.\n"
+            "3. Confidence: Rate your confidence in this diagnosis from 0.0 (not confident) to 1.0 (completely certain).\n\n"
+            "Format:\n"
+            "Reasoning: [your analysis]\n"
+            "Diagnosis: [your diagnosis]\n"
+            "Confidence: [0.0-1.0]\n\n"
+            "Response:"
+        )
+
+        confidence_prompt_str = "\n".join(confidence_prompt)
+        model_input = self._format_model_input(system_prompt_str, confidence_prompt_str)
+
+        try:
+            _, _, response = generate_fn(model_input, 0.0)  # Use temperature 0 for deterministic
+
+            # Parse confidence score
+            import re
+            confidence_pattern = r'[Cc]onfidence\s*:?\s*([0-9]*\.?[0-9]+)'
+            match = re.search(confidence_pattern, response)
+
+            if match:
+                confidence = float(match.group(1))
+                # Clamp to [0, 1]
+                confidence = max(0.0, min(1.0, confidence))
+
+                if self.debug_print:
+                    # Extract diagnosis for debugging
+                    diag_pattern = r'[Dd]iagnosis\s*:?\s*([^\n]+)'
+                    diag_match = re.search(diag_pattern, response)
+                    diagnosis = diag_match.group(1).strip() if diag_match else "N/A"
+                    print(f"    [Confidence] Diagnosis: {diagnosis} | Confidence: {confidence:.3f}", flush=True)
+
+                return confidence
+            else:
+                # If parsing fails, return 0 confidence
+                if self.debug_print:
+                    print("    [Confidence] Failed to parse confidence from response", flush=True)
+                return 0.0
+
+        except Exception as e:
+            if self.debug_print:
+                print(f"    [Confidence] Error estimating confidence: {e}", flush=True)
+            return 0.0  # Return 0 confidence on error
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +1116,10 @@ def train(args) -> None:
         intrinsic_token_weight=args.intrinsic_token_weight,
         intrinsic_turn_weight=args.intrinsic_turn_weight,
         forward_sim_temperature=args.forward_sim_temperature,
+        reward_budget_aware=args.reward_budget_aware,
+        target_num_turns=args.target_num_turns,
+        turn_penalty_weight=args.turn_penalty_weight,
+        turn_reward_weight=args.turn_reward_weight,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1041,7 +1220,7 @@ def train(args) -> None:
     # Ensure model is in training mode for PPO (following CollabLLM)
     policy_model.train()
 
-    for epoch in range(args.num_train_epochs):
+    for epoch in tqdm(range(args.num_train_epochs), desc="Epochs", position=0, disable=not trainer.accelerator.is_main_process):
         scenario_indices = train_indices.copy()
         # random.shuffle(scenario_indices)
         logger.info("Starting epoch %s with %s training scenarios", epoch + 1, len(scenario_indices))
@@ -1050,7 +1229,15 @@ def train(args) -> None:
         epoch_correctness: List[float] = []
         epoch_turns: List[int] = []
 
-        for scenario_idx in scenario_indices:
+        scenario_pbar = tqdm(
+            scenario_indices,
+            desc=f"Epoch {epoch+1}/{args.num_train_epochs} - Scenarios",
+            position=1,
+            leave=False,
+            disable=not trainer.accelerator.is_main_process
+        )
+
+        for scenario_idx in scenario_pbar:
             input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
 
             multi_turn_rewards = episode_info.pop("reward")
@@ -1107,6 +1294,17 @@ def train(args) -> None:
             epoch_rewards.append(reward_value)
             epoch_correctness.append(episode_info.get("correctness", 0.0))
             epoch_turns.append(len(input_tensors))
+
+            # Update progress bar with running metrics
+            if trainer.accelerator.is_main_process:
+                avg_reward = sum(epoch_rewards) / len(epoch_rewards)
+                avg_correctness = sum(epoch_correctness) / len(epoch_correctness)
+                avg_turns = sum(epoch_turns) / len(epoch_turns)
+                scenario_pbar.set_postfix({
+                    'reward': f'{avg_reward:.3f}',
+                    'correct': f'{avg_correctness:.2%}',
+                    'turns': f'{avg_turns:.1f}'
+                })
 
             if args.logging_steps and global_step % args.logging_steps == 0:
                 logger.info(
@@ -1180,7 +1378,7 @@ def train(args) -> None:
         # Evaluate on training set
         train_eval_metrics: List[Dict[str, float]] = []
         logger.info("Evaluating on %d training scenarios...", len(train_indices))
-        for scenario_idx in train_indices:
+        for scenario_idx in tqdm(train_indices, desc="Train Evaluation", disable=not trainer.accelerator.is_main_process):
             input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
             train_eval_metrics.append(
                 {
@@ -1205,7 +1403,7 @@ def train(args) -> None:
         if test_indices:
             test_eval_metrics: List[Dict[str, float]] = []
             logger.info("Evaluating on %d test scenarios...", len(test_indices))
-            for scenario_idx in test_indices:
+            for scenario_idx in tqdm(test_indices, desc="Test Evaluation", disable=not trainer.accelerator.is_main_process):
                 input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
                 test_eval_metrics.append(
                     {
@@ -1340,6 +1538,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intrinsic_token_weight", type=float, default=0.001, help="Penalty weight per token in intrinsic reward (e.g., 0.001)")
     parser.add_argument("--intrinsic_turn_weight", type=float, default=0.0, help="Flat penalty per turn in intrinsic reward")
     parser.add_argument("--forward_sim_temperature", type=float, default=0.0, help="Temperature for forward simulation (0.0 = deterministic)")
+
+    parser.add_argument("--reward_budget_aware", action="store_true", help="Use budget-aware rewards: turn efficiency + confidence-based question utility")
+    parser.add_argument("--target_num_turns", type=int, default=3, help="Target number of interactions for budget-aware reward")
+    parser.add_argument("--turn_penalty_weight", type=float, default=0.1, help="Penalty weight per turn above target")
+    parser.add_argument("--turn_reward_weight", type=float, default=0.05, help="Reward weight per turn below target")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging_steps", type=int, default=10)
