@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 try:  # Optional dependency for 4-bit loading
     from transformers import BitsAndBytesConfig
