@@ -1131,7 +1131,7 @@ class AgentClinicSimulator:
                     vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
                     vllm_verbose=self.vllm_verbose,
                 )
-                correctness = 1.0 if moderator_decision.strip().startswith("yes") else -0.5
+                correctness = 1.0 if moderator_decision.strip().startswith("yes") else -1.0
         return correctness, moderator_decision
 
     def _get_diagnosis_confidence(
