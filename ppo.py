@@ -485,7 +485,9 @@ class AgentClinicSimulator:
             f.write(f"Scenario ID:        {state.scenario_id}\n")
             f.write(f"Number of Turns:    {len(state.actions)}\n")
             f.write(f"Correctness:        {episode_info.get('correctness', 0.0):.3f}\n")
-            f.write(f"Total Reward:       {episode_info.get('reward', 0.0):.3f}\n")
+            reward = episode_info.get('reward', 0.0)
+            total_reward = sum(reward) if isinstance(reward, list) else reward
+            f.write(f"Total Reward:       {total_reward:.3f}\n")
             f.write(f"Budget Saved:       {episode_info.get('budget_saved', 0.0):.3f}\n")
             f.write("=" * 80 + "\n\n")
 
