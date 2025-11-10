@@ -452,7 +452,6 @@ class AgentClinicSimulator:
             max_turns=self.max_turns,
             history=[],
             actions=[],
-            turns=[],
             done=False,
             patient_agent=patient_agent,
             measurement_agent=measurement_agent,
@@ -532,7 +531,7 @@ class AgentClinicSimulator:
             reply_role, reply_text = self._apply_action(state, action)
 
             if self.debug_print:
-                turn_num = len(state.turns)
+                turn_num = len(state.actions)
                 print(
                     f"\n========== EPISODE {state.scenario_id} :: TURN {turn_num} ==========",
                     flush=True,
@@ -586,6 +585,7 @@ class AgentClinicSimulator:
     ) -> Tuple[float, Dict[str, Any]]:
 
         correctness = self._evaluate_correctness(states[-1])[0]
+        budget_saved = states[-1].remaining_budget / float(max(states[-1].max_turns, 1))
 
         # Forward simulation reward: per-turn extrinsic + intrinsic rewards
         if self.reward_forward_sim:
@@ -625,7 +625,7 @@ class AgentClinicSimulator:
 
             return per_turn_rewards, {
                 "correctness": correctness,
-                "budget_saved": state.remaining_budget / float(max(state.max_turns, 1)),
+                "budget_saved": budget_saved,
                 "reward_per_turn": per_turn_rewards,
                 "forward_sim_correctness_avg": sum(forward_sim_correctness) / len(forward_sim_correctness) if forward_sim_correctness else 0.0,
             }
@@ -1116,11 +1116,11 @@ def train(args) -> None:
         train_eval_metrics: List[Dict[str, float]] = []
         logger.info("Evaluating on %d training scenarios...", len(train_indices))
         for scenario_idx in train_indices:
-            state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+            input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
             train_eval_metrics.append(
                 {
                     "correctness": episode_info.get("correctness", 0.0),
-                    "num_turns": len(state.turns),
+                    "num_turns": len(input_tensors),
                 }
             )
 
@@ -1141,11 +1141,11 @@ def train(args) -> None:
             test_eval_metrics: List[Dict[str, float]] = []
             logger.info("Evaluating on %d test scenarios...", len(test_indices))
             for scenario_idx in test_indices:
-                state, episode_info = simulator.run_episode(scenario_idx, generate_response)
+                input_tensors, response_tensors, episode_info = simulator.run_episode(scenario_idx, generate_response)
                 test_eval_metrics.append(
                     {
                         "correctness": episode_info.get("correctness", 0.0),
-                        "num_turns": len(state.turns),
+                        "num_turns": len(input_tensors),
                     }
                 )
 
