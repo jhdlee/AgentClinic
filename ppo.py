@@ -33,6 +33,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# Suppress vLLM progress bars by setting environment variables before vLLM import
+os.environ['VLLM_CONFIGURE_LOGGING'] = '0'
+os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
+
 import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
