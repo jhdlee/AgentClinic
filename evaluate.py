@@ -113,6 +113,7 @@ def load_vllm_for_evaluation(
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
+        disable_log_stats=not verbose,  # Disable progress bars unless verbose mode
     )
     return llm
 
