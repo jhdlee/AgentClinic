@@ -149,7 +149,6 @@ def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9, v
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
         disable_log_stats=not verbose,  # Disable progress bars unless verbose mode
-        use_tqdm=False,
     )
     return llm
 
@@ -175,7 +174,7 @@ def inference_vllm(prompt, llm, max_new_tokens=200, temperature=0.0):
         top_p=1.0,
     )
 
-    outputs = llm.generate([prompt], sampling_params)
+    outputs = llm.generate([prompt], sampling_params, use_tqdm=False)
     response = outputs[0].outputs[0].text.strip()
 
     return response
@@ -1462,7 +1461,6 @@ def train(args) -> None:
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             trust_remote_code=args.trust_remote_code,
             disable_log_stats=not args.vllm_verbose,  # Disable progress bars unless verbose mode
-            use_tqdm=False,
         )
         logger.info("vLLM policy model loaded successfully")
 
@@ -1510,7 +1508,7 @@ def train(args) -> None:
             )
 
             # Generate with vLLM and get token IDs directly
-            outputs = policy_vllm.generate([prompt_for_model], sampling_params)
+            outputs = policy_vllm.generate([prompt_for_model], sampling_params, use_tqdm=False)
             output = outputs[0]
 
             # Extract prompt and completion token IDs
