@@ -495,13 +495,13 @@ class AgentClinicSimulator:
             history_str = [
                 f"{turn['role'].capitalize()}: {turn['content']}" for turn in state.history
             ]
-            prompt.append("; ".join(history_str) + ".")
+            prompt.append("; ".join(history_str))
         else:
             prompt.append("No dialogue yet.")
 
         if turns_remaining == 1:
             prompt.append("This is the final interaction. Do not ask further questions or request additional tests. Provide your complete reasoning process leading to the diagnosis. Then, on a new line, output the final result in the exact format: \"DIAGNOSIS READY: [diagnosis here]\".")
-        prompt.append("Now, please continue your dialogue.\nDoctor: ")
+        prompt.append("\n\nNow, please continue your dialogue.\nDoctor: ")
 
         prompt_str = " ".join(prompt)
 
