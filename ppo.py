@@ -591,10 +591,17 @@ class AgentClinicSimulator:
 
         # Forward simulation reward: per-turn extrinsic + intrinsic rewards
         if self.reward_forward_sim:
+            if self.debug_print:
+                print(
+                    f"\n[Episode {states[0].scenario_id}] Computing forward simulation rewards "
+                    f"for {len(states)} turns | actual_correctness={correctness:.3f}",
+                    flush=True
+                )
+
             per_turn_rewards = []
             forward_sim_correctness = []
 
-            for _, state in enumerate(states):
+            for turn_idx, state in enumerate(states):
                 # Extrinsic reward: forward simulate from this turn
                 extrinsic_correctness, total_num_tokens = self._forward_simulate_from_turn(
                     state, generate_fn
@@ -614,16 +621,28 @@ class AgentClinicSimulator:
                 )
                 per_turn_rewards.append(turn_reward)
 
+                if self.debug_print:
+                    print(
+                        f"  [Turn {turn_idx+1}/{len(states)}] "
+                        f"forward_sim_correct={extrinsic_correctness:.3f} | "
+                        f"tokens={total_num_tokens} | "
+                        f"intrinsic={intrinsic_reward:.4f} | "
+                        f"extrinsic={self.diagnosis_reward_weight * extrinsic_correctness:.4f} | "
+                        f"turn_reward={turn_reward:.4f}",
+                        flush=True
+                    )
+
             if self.debug_print or self.reward_breakdown_debug:
                 print(
-                    f"[Episode {state.scenario_id}] Forward sim reward | "
+                    f"\n[Episode {state.scenario_id}] Forward sim SUMMARY | "
                     f"actual_correctness={correctness:.3f} | "
                     f"avg_forward_sim_correctness={sum(forward_sim_correctness)/len(forward_sim_correctness):.3f} | "
                     f"intrinsic_token_weight={self.intrinsic_token_weight:.4f} | "
                     f"intrinsic_turn_weight={self.intrinsic_turn_weight:.4f} | "
-                    f"total={sum(per_turn_rewards):.3f} | "
+                    f"total_reward={sum(per_turn_rewards):.3f} | "
                     f"reward_per_turn={per_turn_rewards}"
                 )
+                print("=" * 80, flush=True)
 
             return per_turn_rewards, {
                 "correctness": correctness,
@@ -676,10 +695,15 @@ class AgentClinicSimulator:
         """
 
         # state ends with doctor's action. Apply action.
+        starting_turn = len(state.actions)
+
+        if self.debug_print:
+            print(f"    [ForwardSim] Starting from turn {starting_turn}, scenario {state.scenario_id}", flush=True)
 
         action = state.actions[-1]
         _, _ = self._apply_action(state, action)
 
+        sim_turns = 0
         while not state.done:
             # Build prompt (returns tuple: prompt, system_prompt)
             prompt_str, system_prompt_str = self.build_prompt_for_doctor(state)
@@ -693,10 +717,23 @@ class AgentClinicSimulator:
             state.add_turn("doctor", action.text)
             state.total_num_tokens += len(response_tensor)
 
+            sim_turns += 1
+            if self.debug_print:
+                print(f"    [ForwardSim] Sim turn {sim_turns}: {action.type} | tokens={len(response_tensor)}", flush=True)
+
             _, _ = self._apply_action(state, action)
 
         # Evaluate final correctness
         correctness, _ = self._evaluate_correctness(state)
+
+        if self.debug_print:
+            print(
+                f"    [ForwardSim] Complete: simulated {sim_turns} turns | "
+                f"total_tokens={state.total_num_tokens} | "
+                f"correctness={correctness:.3f}",
+                flush=True
+            )
+
         return correctness, state.total_num_tokens
 
     def _evaluate_correctness(
@@ -1002,7 +1039,7 @@ def train(args) -> None:
 
             multi_turn_rewards = episode_info.pop("reward")
             reward_value = sum(multi_turn_rewards)
-            reward_tensors = torch.tensor(multi_turn_rewards, device=device, dtype=torch.float32)
+            reward_tensors = [torch.tensor(r, device=device, dtype=torch.float32) for r in multi_turn_rewards]
 
             # Update batch_size to match the number of turns in this episode
             trainer.config.batch_size = len(input_tensors)
