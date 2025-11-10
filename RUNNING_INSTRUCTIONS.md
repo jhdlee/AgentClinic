@@ -82,6 +82,7 @@ python3 ppo.py \
 
 - `--vllm_tensor_parallel_size`: Number of GPUs for tensor parallelism (default: 1)
 - `--vllm_gpu_memory_utilization`: GPU memory utilization 0.0-1.0 (default: 0.9)
+- `--vllm_verbose`: Enable verbose vLLM logging (default: suppressed for cleaner output)
 
 **Example with multi-GPU:**
 ```bash

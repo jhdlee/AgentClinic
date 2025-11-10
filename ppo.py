@@ -102,7 +102,24 @@ HUGGINGFACE_PIPES = {}
 # vLLM utility functions
 # ---------------------------------------------------------------------------
 
-def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9):
+def suppress_vllm_logging():
+    """
+    Suppress vLLM's verbose INFO-level logging.
+    Sets vLLM loggers to WARNING level to reduce noise.
+    """
+    vllm_loggers = [
+        "vllm.engine.llm_engine",
+        "vllm.engine.async_llm_engine",
+        "vllm.executor.gpu_executor",
+        "vllm.worker.worker",
+        "vllm.config",
+        "vllm.model_executor.model_loader",
+        "vllm",
+    ]
+    for logger_name in vllm_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9, verbose=False):
     """
     Load a vLLM model for faster inference.
 
@@ -110,12 +127,17 @@ def load_vllm_model(model, tensor_parallel_size=1, gpu_memory_utilization=0.9):
         model: The model name/path
         tensor_parallel_size: Number of GPUs to use for tensor parallelism
         gpu_memory_utilization: GPU memory utilization (0.0 to 1.0)
+        verbose: If False (default), suppress vLLM's verbose logging
 
     Returns:
         The vLLM LLM instance
     """
     if LLM is None:
         raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+    # Suppress vLLM logging unless verbose mode is enabled
+    if not verbose:
+        suppress_vllm_logging()
 
     llm = LLM(
         model=model,
@@ -155,7 +177,7 @@ def inference_vllm(prompt, llm, max_new_tokens=200, temperature=0.0):
 # Simple cache for vLLM models so we only load once per model id
 VLLM_MODELS = {}
 
-def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False, vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9):
+def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt_len=2**14, clip_prompt=False, vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9, vllm_verbose=False):
     if clip_prompt:
         prompt = prompt[:max_prompt_len]
 
@@ -170,7 +192,8 @@ def query_model(model, prompt, system_prompt, tries=30, timeout=20.0, max_prompt
             llm = load_vllm_model(
                 model_id,
                 tensor_parallel_size=vllm_tensor_parallel_size,
-                gpu_memory_utilization=vllm_gpu_memory_utilization
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                verbose=vllm_verbose
             )
             VLLM_MODELS[model_id] = llm
             logger.info("vLLM model cached: %s", model_id)
@@ -348,7 +371,7 @@ class ScenarioLoaderMedQA:
 # Agents
 # ---------------------------------------------------------------------------
 class PatientAgent:
-    def __init__(self, scenario, backend_str="gpt4") -> None:
+    def __init__(self, scenario, backend_str="gpt4", vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9, vllm_verbose=False) -> None:
         # disease of patient, or "correct answer"
         self.disease = ""
         # symptoms that patient presents
@@ -361,9 +384,20 @@ class PatientAgent:
         self.scenario = scenario
         self.reset()
         self.pipe = None
+        # vLLM configuration
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        self.vllm_verbose = vllm_verbose
 
     def inference_patient(self, question) -> str:
-        answer = query_model(self.backend, "\nHere is a history of your dialogue: " + self.agent_hist + "\n Here was the doctor response: " + question + "Now please continue your dialogue\nPatient: ", self.system_prompt())
+        answer = query_model(
+            self.backend,
+            "\nHere is a history of your dialogue: " + self.agent_hist + "\n Here was the doctor response: " + question + "Now please continue your dialogue\nPatient: ",
+            self.system_prompt(),
+            vllm_tensor_parallel_size=self.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+            vllm_verbose=self.vllm_verbose
+        )
         self.agent_hist += question + "\n\n" + answer + "\n\n"
         return answer
 
@@ -380,10 +414,10 @@ class PatientAgent:
         self.agent_hist += hist_str + "\n\n"
 
 class MeasurementAgent:
-    def __init__(self, scenario, backend_str="gpt4") -> None:
+    def __init__(self, scenario, backend_str="gpt4", vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9, vllm_verbose=False) -> None:
         # conversation history between doctor and patient
         self.agent_hist = ""
-        # presentation information for measurement 
+        # presentation information for measurement
         self.presentation = ""
         # language model backend for measurement agent
         self.backend = backend_str
@@ -391,10 +425,21 @@ class MeasurementAgent:
         self.scenario = scenario
         self.pipe = None
         self.reset()
+        # vLLM configuration
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        self.vllm_verbose = vllm_verbose
 
     def inference_measurement(self, question) -> str:
         answer = str()
-        answer = query_model(self.backend, "\nHere is a history of the dialogue: " + self.agent_hist + "\n Here was the doctor measurement request: " + question, self.system_prompt())
+        answer = query_model(
+            self.backend,
+            "\nHere is a history of the dialogue: " + self.agent_hist + "\n Here was the doctor measurement request: " + question,
+            self.system_prompt(),
+            vllm_tensor_parallel_size=self.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+            vllm_verbose=self.vllm_verbose
+        )
         self.agent_hist += question + "\n\n" + answer + "\n\n"
         return answer
 
@@ -411,8 +456,15 @@ class MeasurementAgent:
         self.information = self.scenario.exam_information()
 
 
-def compare_results(diagnosis, correct_diagnosis, moderator_llm):
-    answer = query_model(moderator_llm, "\nHere is the correct diagnosis: " + correct_diagnosis + "\n Here was the doctor dialogue: " + diagnosis + "\nAre these the same?", "You are responsible for determining if the corrent diagnosis and the doctor diagnosis are the same disease. Please respond only with Yes or No. Nothing else.")
+def compare_results(diagnosis, correct_diagnosis, moderator_llm, vllm_tensor_parallel_size=1, vllm_gpu_memory_utilization=0.9, vllm_verbose=False):
+    answer = query_model(
+        moderator_llm,
+        "\nHere is the correct diagnosis: " + correct_diagnosis + "\n Here was the doctor dialogue: " + diagnosis + "\nAre these the same?",
+        "You are responsible for determining if the corrent diagnosis and the doctor diagnosis are the same disease. Please respond only with Yes or No. Nothing else.",
+        vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        vllm_verbose=vllm_verbose
+    )
     return answer.lower()
 
 
@@ -524,6 +576,9 @@ class AgentClinicSimulator:
         turn_reward_weight: float = 0.05,
         save_llm_outputs: bool = False,
         output_dir: Optional[str] = None,
+        vllm_tensor_parallel_size: int = 1,
+        vllm_gpu_memory_utilization: float = 0.9,
+        vllm_verbose: bool = False,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -553,6 +608,9 @@ class AgentClinicSimulator:
         self.turn_reward_weight = float(turn_reward_weight)
         self.save_llm_outputs = save_llm_outputs
         self.output_dir = output_dir
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        self.vllm_verbose = vllm_verbose
 
     @staticmethod
     def _format_model_input(system_prompt: str, prompt: str) -> Tuple[str, str]:
@@ -653,10 +711,16 @@ class AgentClinicSimulator:
         patient_agent = PatientAgent(
             scenario=scenario,
             backend_str=self.patient_backend,
+            vllm_tensor_parallel_size=self.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+            vllm_verbose=self.vllm_verbose,
         )
         measurement_agent = MeasurementAgent(
             scenario=scenario,
             backend_str=self.measurement_backend,
+            vllm_tensor_parallel_size=self.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+            vllm_verbose=self.vllm_verbose,
         )
         patient_agent.reset()
         measurement_agent.reset()
@@ -1058,6 +1122,9 @@ class AgentClinicSimulator:
                     diagnosis=state.diagnosis_action.text,
                     correct_diagnosis=gold_text,
                     moderator_llm=self.moderator_backend,
+                    vllm_tensor_parallel_size=self.vllm_tensor_parallel_size,
+                    vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+                    vllm_verbose=self.vllm_verbose,
                 )
                 correctness = 1.0 if moderator_decision.strip().startswith("yes") else -0.5
         return correctness, moderator_decision
@@ -1336,6 +1403,9 @@ def train(args) -> None:
         turn_reward_weight=args.turn_reward_weight,
         save_llm_outputs=args.save_llm_outputs,
         output_dir=output_dir,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_verbose=args.vllm_verbose,
     )
 
     bnb_config = create_bnb_config(args)
@@ -1374,6 +1444,9 @@ def train(args) -> None:
     if args.use_vllm_policy:
         if LLM is None:
             raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+        # Suppress vLLM logging unless verbose mode is enabled
+        if not args.vllm_verbose:
+            suppress_vllm_logging()
         logger.info("Loading vLLM for policy model generation (training)")
         model_source = args.model_name or args.base_model_name
         model_source = model_source.replace("HF_", "")
@@ -1788,6 +1861,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_vllm_policy", action="store_true", help="Use vLLM for policy model generation during training (significantly faster inference)")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Number of GPUs to use for vLLM tensor parallelism")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM (0.0-1.0)")
+    parser.add_argument("--vllm_verbose", action="store_true", help="Enable verbose logging for vLLM (default: suppressed)")
 
     parser.add_argument("--use_lora", action="store_true", help="Enable LoRA adapters for efficient fine-tuning")
     parser.add_argument("--peft_r", type=int, default=32)

@@ -50,6 +50,24 @@ from ppo import (
 logger = logging.getLogger(__name__)
 
 
+def suppress_vllm_logging():
+    """
+    Suppress vLLM's verbose INFO-level logging.
+    Sets vLLM loggers to WARNING level to reduce noise.
+    """
+    vllm_loggers = [
+        "vllm.engine.llm_engine",
+        "vllm.engine.async_llm_engine",
+        "vllm.executor.gpu_executor",
+        "vllm.worker.worker",
+        "vllm.config",
+        "vllm.model_executor.model_loader",
+        "vllm",
+    ]
+    for logger_name in vllm_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
 def load_model_for_evaluation(
     model_name: str,
     bnb_config: Optional[BitsAndBytesConfig],
@@ -77,10 +95,15 @@ def load_vllm_for_evaluation(
     model_name: str,
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
+    verbose: bool = False,
 ):
     """Load vLLM model for faster evaluation."""
     if LLM is None:
         raise ImportError("vLLM is not installed. Install it with: pip install vllm")
+
+    # Suppress vLLM logging unless verbose mode is enabled
+    if not verbose:
+        suppress_vllm_logging()
 
     model_name = model_name.replace("HF_", "").replace("VLLM_", "")
     logger.info("Loading vLLM model from %s", model_name)
@@ -146,6 +169,7 @@ def evaluate(args) -> None:
             model_source,
             tensor_parallel_size=args.vllm_tensor_parallel_size,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            verbose=args.vllm_verbose,
         )
         model = None
     else:
@@ -437,6 +461,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_vllm_policy", action="store_true", help="Use vLLM for policy model inference (faster)")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Number of GPUs to use for vLLM tensor parallelism")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM (0.0-1.0)")
+    parser.add_argument("--vllm_verbose", action="store_true", help="Enable verbose logging for vLLM (default: suppressed)")
 
     parser.add_argument("--use_4bit", action="store_true")
     parser.add_argument("--bf16", action="store_true")
