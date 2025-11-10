@@ -698,7 +698,11 @@ class AgentClinicSimulator:
         starting_turn = len(state.actions)
 
         if self.debug_print:
-            print(f"    [ForwardSim] Starting from turn {starting_turn}, scenario {state.scenario_id}", flush=True)
+            print(
+                f"    [ForwardSim] Starting from turn {starting_turn}, scenario {state.scenario_id} | "
+                f"temperature={self.forward_sim_temperature}",
+                flush=True
+            )
 
         action = state.actions[-1]
         _, _ = self._apply_action(state, action)
@@ -709,9 +713,8 @@ class AgentClinicSimulator:
             prompt_str, system_prompt_str = self.build_prompt_for_doctor(state)
             model_input = self._format_model_input(system_prompt_str, prompt_str)
 
-            # Generate with deterministic temperature
-            # Note: generate_fn uses the configured temperature
-            _, response_tensor, doctor_response = generate_fn(model_input)
+            # Generate with forward_sim_temperature (typically 0.0 for deterministic)
+            _, response_tensor, doctor_response = generate_fn(model_input, self.forward_sim_temperature)
             action = parse_action(doctor_response)
             state.actions.append(action)
             state.add_turn("doctor", action.text)
@@ -973,6 +976,7 @@ def train(args) -> None:
 
     def generate_response(
         prompt: Tuple[str, str],
+        temperature_override: Optional[float] = None,
     ) -> Tuple[torch.LongTensor, torch.LongTensor, str]:
         system_prompt_text, user_prompt_text = prompt
 
@@ -997,13 +1001,25 @@ def train(args) -> None:
         query_tensors = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
 
+        # Override temperature for forward simulation if specified
+        gen_kwargs = generation_kwargs.copy()
+        if temperature_override is not None:
+            gen_kwargs["temperature"] = temperature_override
+            gen_kwargs["do_sample"] = temperature_override > 0
+
+        if args.debug_print and temperature_override is None:
+            # Only print once per episode to avoid spam
+            if not hasattr(generate_response, '_temp_printed'):
+                print(f"[Generation] Using temperature={gen_kwargs['temperature']}, do_sample={gen_kwargs['do_sample']}", flush=True)
+                generate_response._temp_printed = True
+
         # Keep model in training mode during PPO rollout (following CollabLLM)
         # This ensures policy consistency between data collection and optimization
         with torch.no_grad():
             output_tensors = policy_model.generate(
                 query_tensors,
                 attention_mask=attention_mask,
-                **generation_kwargs,
+                **gen_kwargs,
             )
 
         generated_tokens = output_tensors[:, query_tensors.shape[-1]:]
